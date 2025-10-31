@@ -17,3 +17,7 @@ if label_cols:
     print(df[label_col].value_counts())
 else:
     print("\n⚠️ Không tìm thấy cột nhãn, cần xem lại cấu trúc dataset.")
+print("Các cột trong file CSV:")
+print(df.columns)
+print(df.head())
+
