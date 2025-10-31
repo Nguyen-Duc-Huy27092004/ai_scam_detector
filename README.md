@@ -15,7 +15,7 @@ A lightweight web app using Machine Learning to detect phishing or scam URLs.
 
 ## ⚙️ Installation
 ```bash
-git clone https://github.com/yourusername/ai_scam_detector.git
+git clone https://github.com/Nguyen-Duc-Huy27092004/ai_scam_detector.git
 cd ai_scam_detector
 pip install -r requirements.txt
 python app.py
