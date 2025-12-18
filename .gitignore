@@ -2,6 +2,8 @@
 # Environment
 # =========================
 .env
+.env.local
+.env.production
 
 # =========================
 # Python
@@ -9,14 +11,23 @@
 __pycache__/
 *.pyc
 *.pyo
+.venv/
+venv/
+.python-version
 
 # =========================
-# Machine Learning
+# Machine Learning (IMPORTANT)
 # =========================
-models/
-data/
-*.pkl
-*.h5
+# Keep folder structure, ignore large files
+data/**/*.csv
+data/**/*.zip
+data/**/*.png
+data/**/*.jpg
+data/**/*.jpeg
+
+models/**/*.pkl
+models/**/*.h5
+models/**/*.joblib
 
 # =========================
 # Logs
@@ -29,6 +40,7 @@ data/
 node_modules/
 .next/
 dist/
+coverage/
 pnpm-lock.yaml
 
 # =========================
