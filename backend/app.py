@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 import joblib
-from feature_extraction import extract_features_from_url
+from backend.ml.url.feature_extraction import extract_features_from_url
 from flask_cors import CORS
 
 app = Flask(__name__)
