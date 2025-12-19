@@ -1,6 +1,6 @@
 import pandas as pd
 
-# ===== Load dataset =====
+# Load data
 df = pd.read_csv("data/phishing.csv")
 
 print("5 dòng đầu tiên:")
@@ -18,11 +18,9 @@ if "CLASS_LABEL" not in df.columns:
 print("\n Phân bố nhãn (CLASS_LABEL):")
 print(df["CLASS_LABEL"].value_counts())
 
-# ===== Check missing values =====
 print("\nMissing values:")
 print(df.isnull().sum().sum())
-
-# ===== Feature count =====
+# Count feature columns
 feature_cols = [col for col in df.columns if col not in ["CLASS_LABEL", "id"]]
 print("\n🔢 Số feature:", len(feature_cols))
 
