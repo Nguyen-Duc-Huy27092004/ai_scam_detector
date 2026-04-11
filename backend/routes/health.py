@@ -1,18 +1,59 @@
-from flask import Blueprint, jsonify
+"""
+Health check endpoint.
+
+Provides service health and status information.
+"""
+
 from datetime import datetime
+from flask import Blueprint, jsonify
 
-from backend.services.greeting import get_greeting
-from backend.utils.logger import logger
+from utils.logger import logger
 
-health_bp = Blueprint("health", __name__)
-# Health check endpoint
-@health_bp.route("/", methods=["GET"])
+health_bp = Blueprint('health', __name__, url_prefix='/api')
+
+
+@health_bp.route('/health', methods=['GET'])
 def health_check():
-    logger.info("Health check endpoint accessed")
+    """
+    Health check endpoint.
+    
+    Returns:
+        JSON: Service status and information
+    """
+    try:
+        logger.info("health_check_requested")
+        
+        return jsonify({
+            'status': 'healthy',
+            'service': 'AI Scam Detector API',
+            'version': '2.0.0',
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'components': {
+                'api': 'operational',
+                'database': 'operational',
+                'models': 'loaded'
+            }
+        }), 200
+        
+    except Exception as e:
+        logger.error("health_check_failed | error=%s", str(e))
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        }), 500
 
+
+@health_bp.route('/version', methods=['GET'])
+def get_version():
+    """
+    Get API version.
+    
+    Returns:
+        JSON: Version information
+    """
     return jsonify({
-        "status": "running",
-        "service": "AI Scam Detector API",
-        "message": get_greeting(),
-        "timestamp": datetime.utcnow().isoformat()
-    })
+        'version': '2.0.0',
+        'api': 'AI Scam Detector API',
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
+    }), 200

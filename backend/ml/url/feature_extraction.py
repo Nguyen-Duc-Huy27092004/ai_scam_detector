@@ -1,55 +1,130 @@
 import re
-import urllib.parse
-import numpy as np
+import math
+from urllib.parse import urlparse, parse_qs
+from typing import Dict, Any, Optional
+from bs4 import BeautifulSoup
+from utils.logger import logger
 
-def extract_features_from_url(url: str) -> np.ndarray:
-    parsed = urllib.parse.urlparse(url)
 
-    hostname = parsed.netloc
-    path = parsed.path
-    query = parsed.query
+class URLFeatureExtractor:
 
-    def count_digits(s):
-        return sum(c.isdigit() for c in s)
+    SUSPICIOUS_KEYWORDS = {
+        'update', 'verify', 'confirm', 'account', 'bank', 'secure',
+        'login', 'password', 'urgent', 'action', 'click', 'alert',
+        'wallet', 'payment', 'invoice', 'refund'
+    }
 
-    def has_ip_address(host):
-        return 1 if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host) else 0
+    SUSPICIOUS_TLDS = {
+        'tk', 'ml', 'ga', 'cf', 'xyz', 'top', 'win', 'review'
+    }
 
-    features = []
+    @staticmethod
+    def _shannon_entropy(s: str) -> float:
+        if not s:
+            return 0.0
+        prob = [float(s.count(c)) / len(s) for c in dict.fromkeys(list(s))]
+        return -sum(p * math.log2(p) for p in prob)
 
-    features.append(len(url))                 
-    features.append(len(hostname))          
-    features.append(len(path))           
-    features.append(len(query))           
+    @staticmethod
+    def extract_features(url: str, html_content: Optional[str] = None) -> Dict[str, Any]:
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower()
+            path = parsed.path.lower()
+            query = parsed.query.lower()
 
-    features.append(url.count('.'))           
-    features.append(hostname.count('.'))          
-    features.append(url.count('-'))          
-    features.append(url.count('_'))            
-    features.append(url.count('%'))             
-    features.append(url.count('@'))                  
-    features.append(url.count('#'))                  
-    features.append(url.count('//') - 1)           
+            features = {}
+            signals = []
 
-    features.append(count_digits(url))       
-    features.append(1 if re.search(r"[A-Za-z]{4,}\d+", url) else 0)  
-    features.append(1 if "login" in url.lower() else 0)         
-    features.append(1 if "verify" in url.lower() else 0)        
-    features.append(1 if "update" in url.lower() else 0)      
-    features.append(1 if "secure" in url.lower() else 0)      
+            # Basic
+            features['url_length'] = len(url)
+            features['domain_length'] = len(domain)
+            features['path_length'] = len(path)
+            features['subdomain_count'] = domain.count('.') - 1
+            features['digit_count'] = sum(c.isdigit() for c in url)
+            features['special_char_count'] = len(re.findall(r'[!@#$%^&*()_+=\[\]{};:,.<>?/]', url))
+            features['entropy'] = URLFeatureExtractor._shannon_entropy(domain)
 
-    features.append(0 if url.startswith("https") else 1)           
-    features.append(has_ip_address(hostname))                      
-    features.append(1 if hostname.startswith("www") else 0)        
-    features.append(len(hostname.split('.')))                  
+            # HTTPS
+            features['has_https'] = 1 if parsed.scheme == 'https' else 0
+            if features['has_https'] == 0:
+                signals.append("Website không dùng HTTPS")
 
-    features.append(query.count('&'))                         
-    features.append(1 if '=' in query else 0)             
+            # IP address
+            ip_pattern = r'\d+\.\d+\.\d+\.\d+'
+            features['has_ip_address'] = 1 if re.fullmatch(ip_pattern, domain) else 0
+            if features['has_ip_address']:
+                signals.append("URL sử dụng địa chỉ IP")
 
-    features.append(path.count('/'))                             
-    features.append(1 if hostname.split('.')[0] in path else 0)     
+            # TLD
+            tld = domain.split('.')[-1]
+            features['suspicious_tld'] = 1 if tld in URLFeatureExtractor.SUSPICIOUS_TLDS else 0
+            if features['suspicious_tld']:
+                signals.append("TLD đáng ngờ")
 
-    while len(features) < 48:
-        features.append(0)
+            # Keywords
+            domain_kw = sum(1 for k in URLFeatureExtractor.SUSPICIOUS_KEYWORDS if k in domain)
+            path_kw = sum(1 for k in URLFeatureExtractor.SUSPICIOUS_KEYWORDS if k in path)
+            query_kw = sum(1 for k in URLFeatureExtractor.SUSPICIOUS_KEYWORDS if k in query)
 
-    return np.array(features)
+            features['suspicious_domain_words'] = domain_kw
+            features['suspicious_path_words'] = path_kw
+            features['suspicious_query_words'] = query_kw
+
+            if domain_kw + path_kw + query_kw > 0:
+                signals.append("URL chứa từ khóa lừa đảo")
+
+            # Query params
+            features['query_param_count'] = len(parse_qs(query))
+
+            # HTML-based features
+            features['has_form'] = 0
+            features['has_password_input'] = 0
+            features['external_link_ratio'] = 0
+
+            if html_content:
+                soup = BeautifulSoup(html_content, "html.parser")
+                forms = soup.find_all("form")
+                features['has_form'] = 1 if forms else 0
+                if forms:
+                    signals.append("Trang web có form nhập liệu")
+
+                password_inputs = soup.find_all("input", {"type": "password"})
+                features['has_password_input'] = 1 if password_inputs else 0
+                if password_inputs:
+                    signals.append("Trang web yêu cầu nhập mật khẩu")
+
+                links = soup.find_all("a", href=True)
+                external = [a for a in links if domain not in a['href']]
+                if links:
+                    features['external_link_ratio'] = len(external) / len(links)
+
+            features["_signals"] = signals
+
+            logger.debug("url_features_extracted | url=%s", url[:60])
+            return features
+
+        except Exception as e:
+            logger.error("feature_extraction_failed | error=%s", str(e))
+            return {"url_length": len(url), "_signals": []}
+
+    @staticmethod
+    def get_feature_names():
+        return [
+            'url_length', 'domain_length', 'path_length', 'subdomain_count',
+            'digit_count', 'special_char_count', 'entropy', 'has_https',
+            'has_ip_address', 'suspicious_tld',
+            'suspicious_domain_words', 'suspicious_path_words',
+            'suspicious_query_words', 'query_param_count',
+            'has_form', 'has_password_input', 'external_link_ratio'
+        ]
+
+    @staticmethod
+    def get_feature_vector(features: Dict[str, Any]) -> list:
+        vector = []
+        for name in URLFeatureExtractor.get_feature_names():
+            value = features.get(name, 0)
+            if isinstance(value, bool):
+                value = 1 if value else 0
+            vector.append(value)
+        return vector
