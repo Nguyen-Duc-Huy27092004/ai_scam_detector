@@ -8,9 +8,11 @@ from typing import Dict, Any
 
 from utils.logger import logger, log_analysis_result
 from ml.text.text_classifier import classify_text, TextScamClassifier
-from services.risk_level import calculate_text_risk
+from services.risk_level import calculate_risk
 from services.advisor import generate_advice, get_recommendations
 from ml.url.db import AnalysisHistory
+from llm.llm_explainer import generate_explanation
+
 
 
 class TextAnalysisPipeline:
@@ -42,7 +44,7 @@ class TextAnalysisPipeline:
             result['steps_completed'].append('keywords_extracted')
 
             # Step 3: Risk Calculation
-            risk_level, overall_score = calculate_text_risk(text_confidence)
+            risk_level, overall_score, _ = calculate_risk(url_ml_confidence=text_confidence)
             risk_level = risk_level.lower()
 
             result['risk_level'] = risk_level
@@ -54,10 +56,31 @@ class TextAnalysisPipeline:
             advice = generate_advice('text', risk_level, risk_factors, text_confidence)
             recommendations = get_recommendations(risk_level, 'text')
 
+            # 🔥 AI Explanation Step
+            llm_exp = generate_explanation({
+                "overall_score": overall_score,
+                "risk_level": risk_level,
+                "risk_factors": risk_factors,
+                "scam_type": "text_scam",
+                "confidence": text_confidence,
+                "content_summary": text[:500]
+            })
+            result['llm_explanation'] = llm_exp
+
+            if 'analysis_summary' in llm_exp:
+                # Merge or replace static advice with AI advice
+                advice_text = advice.get('advice', '') if isinstance(advice, dict) else str(advice)
+                advice_text += f"\n\n🤖 AI NHẬN XÉT:\n{llm_exp['analysis_summary']}\n\n👉 KHUYÊN DÙNG: {llm_exp['recommended_action']}"
+                if isinstance(advice, dict):
+                    advice['advice'] = advice_text
+                else:
+                    advice = advice_text
+
             result['advice'] = advice
             result['recommendations'] = recommendations
             result['risk_factors'] = risk_factors
             result['steps_completed'].append('advice_generated')
+
 
             # Step 5: Save to Database
             evidence_json = json.dumps({

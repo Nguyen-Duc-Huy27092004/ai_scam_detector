@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 
-from backend.entities.scam_evidence import ScamEvidence
+from entities.scam_evidence import ScamEvidence
 
 
 @dataclass

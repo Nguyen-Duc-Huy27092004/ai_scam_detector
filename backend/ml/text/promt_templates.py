@@ -97,9 +97,9 @@ def _build_advice(risk_level: str) -> List[str]:
     return tpl["advice"]
 
 
-# ==============================
+#######################
 # Main generators
-# ==============================
+#######################
 
 def generate_text_advice(
     risk_level: str,
@@ -145,7 +145,6 @@ def generate_url_advice(
         "advice": template["advice"]
     }
 
-
 def generate_image_advice(
     risk_level: str,
     ocr_flags: List[str]
@@ -160,7 +159,6 @@ def generate_image_advice(
         "reasons": reasons,
         "advice": template["advice"]
     }
-
 
 def generate_final_advice(
     input_type: str,

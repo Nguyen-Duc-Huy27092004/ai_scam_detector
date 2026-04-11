@@ -5,8 +5,11 @@ import type React from "react"
 import { useState, useRef, useEffect } from "react"
 import Navbar from "@/components/navbar"
 import Footer from "@/components/footer"
+import { analyzeImage, chatCompletions, ChatMessage } from "@/services/api"
 
 interface Message {
+
+
   id: string
   type: "user" | "ai"
   content: string
@@ -33,6 +36,8 @@ export default function ConsultationPage() {
   const [inputValue, setInputValue] = useState("")
   const [isLoading, setIsLoading] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
@@ -42,7 +47,7 @@ export default function ConsultationPage() {
     scrollToBottom()
   }, [messages])
 
-  const handleSendMessage = () => {
+  const handleSendMessage = async () => {
     if (!inputValue.trim()) return
 
     const userMessage: Message = {
@@ -53,22 +58,81 @@ export default function ConsultationPage() {
     }
 
     setMessages((prev) => [...prev, userMessage])
+    const promptText = inputValue
     setInputValue("")
     setIsLoading(true)
 
-    // Simulate AI response
-    setTimeout(() => {
+    try {
+      // Build full message history for context-aware conversation
+      const history: ChatMessage[] = messages
+        .filter((m) => m.type === "user" || m.type === "ai")
+        .map((m) => ({
+          role: m.type === "user" ? "user" : "assistant",
+          content: m.content,
+        }))
+      history.push({ role: "user", content: promptText })
+
+      const responseText = await chatCompletions(history)
+
       const aiResponse: Message = {
         id: (Date.now() + 1).toString(),
         type: "ai",
-        content:
-          "I've analyzed your query. Based on current phishing trends and security patterns, here's what I found...\n\nThis is a simulated AI response. In a production environment, this would be powered by advanced AI models to provide detailed security analysis and recommendations.",
+        content: responseText || "Tôi không có đủ thông tin để đưa ra tư vấn cụ thể. Hãy cung cấp thêm ngữ cảnh.",
+        timestamp: new Date(),
+      }
+
+      setMessages((prev) => [...prev, aiResponse])
+    } catch (e: any) {
+      const errorResponse: Message = {
+        id: (Date.now() + 1).toString(),
+        type: "ai",
+        content: "Lỗi kết nối đến máy chủ: " + (e.message || "Không rõ nguyên nhân"),
+        timestamp: new Date(),
+      }
+      setMessages((prev) => [...prev, errorResponse])
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    const userMessage: Message = {
+      id: Date.now().toString(),
+      type: "user",
+      content: "📷 Đã gửi một hình ảnh để phân tích.",
+      timestamp: new Date(),
+    }
+
+    setMessages((prev) => [...prev, userMessage])
+    setIsLoading(true)
+
+    try {
+      const result = await analyzeImage(file)
+      const aiResponse: Message = {
+        id: (Date.now() + 1).toString(),
+        type: "ai",
+        content: result.advice?.advice || result.advice || "Tôi không nhận được phản hồi tư vấn cho ảnh.",
         timestamp: new Date(),
       }
       setMessages((prev) => [...prev, aiResponse])
+    } catch (e: any) {
+      const errorResponse: Message = {
+        id: (Date.now() + 1).toString(),
+        type: "ai",
+        content: "Lỗi phân tích hình ảnh: " + (e.message || "Không rõ nguyên nhân"),
+        timestamp: new Date(),
+      }
+      setMessages((prev) => [...prev, errorResponse])
+    } finally {
       setIsLoading(false)
-    }, 1500)
+      if (fileInputRef.current) fileInputRef.current.value = ""
+    }
   }
+
+
 
   const handleClearChat = () => {
     setMessages([
@@ -178,6 +242,13 @@ export default function ConsultationPage() {
           <div className="glow-border p-4 bg-card/30 backdrop-blur-sm">
             <div className="flex gap-2">
               <input
+                type="file"
+                ref={fileInputRef}
+                className="hidden"
+                accept="image/*"
+                onChange={handleImageUpload}
+              />
+              <input
                 type="text"
                 value={inputValue}
                 onChange={(e) => setInputValue(e.target.value)}
@@ -192,11 +263,16 @@ export default function ConsultationPage() {
               >
                 {isLoading ? "⟳" : "📨"}
               </button>
-              <button className="p-3 hover:bg-card/50 rounded-lg transition-colors text-foreground/60 hover:text-foreground">
+              <button 
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isLoading}
+                className="p-3 hover:bg-card/50 rounded-lg transition-colors text-foreground/60 hover:text-foreground disabled:opacity-50"
+              >
                 📎
               </button>
             </div>
           </div>
+
         </div>
       </main>
 

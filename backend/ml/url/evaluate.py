@@ -1,10 +1,10 @@
 import joblib
 import pandas as pd
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
-
-MODEL_PATH = "models/phishing_detector.pkl"
-SCALER_PATH = "models/scaler.pkl"
-DATA_PATH = "data/phishing.csv"
+from pathlib import Path
+MODEL_PATH = Path("models/phishing_detector.pkl")
+SCALER_PATH = Path("models/scaler.pkl")
+DATA_PATH = Path("data/phishing.csv")
 
 model = joblib.load(MODEL_PATH)
 scaler = joblib.load(SCALER_PATH)

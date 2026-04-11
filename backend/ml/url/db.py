@@ -84,6 +84,21 @@ class DatabaseConnection:
             logger.error("update_execution_failed | error=%s", str(e))
             return None
 
+    def execute_delete(self, query: str, params: tuple = ()) -> int:
+        # FIX: execute_update returns lastrowid which is 0 for DELETE statements.
+        # This dedicated method returns cursor.rowcount (actual deleted row count).
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            conn.commit()
+            count = cursor.rowcount  # FIX: rowcount reflects DELETE/UPDATE affected rows
+            conn.close()
+            return count if count >= 0 else 0
+        except Exception as e:
+            logger.error("delete_execution_failed | error=%s", str(e))
+            return 0
+
 
 # Global DB instance
 _db_instance: Optional[DatabaseConnection] = None
@@ -184,4 +199,6 @@ class AnalysisHistory:
             DELETE FROM analysis_history
             WHERE timestamp < datetime('now', ?)
         """
-        return db.execute_update(query, (f"-{days} days",))
+        # FIX: Use execute_delete() which returns cursor.rowcount,
+        # not execute_update() which returns lastrowid (always 0 for DELETEs).
+        return db.execute_delete(query, (f"-{days} days",))

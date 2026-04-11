@@ -1,152 +1,192 @@
 """
 Screenshot capture service for websites.
-
-Captures screenshots of websites for analysis.
 """
 
-import subprocess
 import uuid
 from pathlib import Path
 from typing import Optional
-from utils.logger import logger
-from config import SCREENSHOTS_DIR, SCREENSHOT_TIMEOUT, USER_AGENT
 
-# Try to import required libraries
-try:
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    SELENIUM_AVAILABLE = True
-except ImportError:
-    SELENIUM_AVAILABLE = False
-    logger.warning("selenium not available | using_playwright")
+from utils.logger import logger
+from utils.config import SCREENSHOTS_DIR, SCREENSHOT_TIMEOUT, USER_AGENT
+
+
+# ==========================
+# Engine availability
+# ==========================
 
 try:
     from playwright.sync_api import sync_playwright
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
-    logger.warning("playwright not available")
+    logger.warning("playwright_not_available")
 
+try:
+    from selenium import webdriver
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
+    logger.warning("selenium_not_available")
+
+
+# ==========================
+# Utils
+# ==========================
+
+def _ensure_dir() -> Optional[Path]:
+    try:
+        path = Path(SCREENSHOTS_DIR)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    except Exception as e:
+        logger.error("screenshot_dir_create_failed | %s", str(e))
+        return None
+
+
+# ==========================
+# Service
+# ==========================
 
 class ScreenshotService:
-    """Service for capturing website screenshots."""
-    
+
+    # ======================
+    # Playwright (BEST)
+    # ======================
     @staticmethod
     def capture_with_playwright(url: str) -> Optional[str]:
-        """
-        Capture screenshot using Playwright.
-        
-        Args:
-            url: URL to capture
-            
-        Returns:
-            str: Path to screenshot file or None
-        """
         if not PLAYWRIGHT_AVAILABLE:
-            logger.warning("playwright_not_available")
             return None
-        
+
+        base_dir = _ensure_dir()
+        if not base_dir:
+            return None
+
+        screenshot_path = base_dir / f"{uuid.uuid4()}.png"
+
         try:
-            screenshot_filename = f"{uuid.uuid4()}.png"
-            screenshot_path = SCREENSHOTS_DIR / screenshot_filename
-            
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                
-                page.goto(url, wait_until='domcontentloaded', timeout=SCREENSHOT_TIMEOUT * 1000)
-                page.screenshot(path=str(screenshot_path), full_page=True)
-                
+
+                context = browser.new_context(user_agent=USER_AGENT)
+                page = context.new_page()
+
+                # retry 1 lần nếu fail
+                try:
+                    page.goto(url, timeout=SCREENSHOT_TIMEOUT * 1000)
+                except:
+                    page.goto(url, timeout=SCREENSHOT_TIMEOUT * 2000)
+
+                page.wait_for_timeout(1000)
+
+                page.screenshot(
+                    path=str(screenshot_path),
+                    full_page=True
+                )
+
+                context.close()   # 🔥 FIX leak
                 browser.close()
-            
-            logger.info("screenshot_captured | url=%s | path=%s", url[:50], screenshot_filename)
+
+            logger.info(
+                "screenshot_playwright_success | file=%s",
+                screenshot_path.name
+            )
+
             return str(screenshot_path)
-            
+
         except Exception as e:
-            logger.error("screenshot_capture_failed_playwright | error=%s", str(e))
+            logger.error(
+                "screenshot_playwright_failed | %s | %s",
+                url[:50],
+                str(e)
+            )
             return None
-    
+
+    # ======================
+    # Selenium (fallback)
+    # ======================
     @staticmethod
     def capture_with_selenium(url: str) -> Optional[str]:
-        """
-        Capture screenshot using Selenium.
-        
-        Args:
-            url: URL to capture
-            
-        Returns:
-            str: Path to screenshot file or None
-        """
         if not SELENIUM_AVAILABLE:
-            logger.warning("selenium_not_available")
             return None
-        
+
+        base_dir = _ensure_dir()
+        if not base_dir:
+            return None
+
+        screenshot_path = base_dir / f"{uuid.uuid4()}.png"
+        driver = None
+
         try:
-            screenshot_filename = f"{uuid.uuid4()}.png"
-            screenshot_path = SCREENSHOTS_DIR / screenshot_filename
-            
             options = webdriver.ChromeOptions()
-            options.add_argument('--headless')
-            options.add_argument('--no-sandbox')
-            options.add_argument('--disable-dev-shm-usage')
-            options.add_argument(f'user-agent={USER_AGENT}')
-            
+            options.add_argument("--headless=new")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument(f"user-agent={USER_AGENT}")
+
             driver = webdriver.Chrome(options=options)
+
             driver.set_page_load_timeout(SCREENSHOT_TIMEOUT)
-            
-            driver.get(url)
+            driver.set_window_size(1920, 1080)   # 🔥 FIX UI
+
+            try:
+                driver.get(url)
+            except:
+                logger.warning("selenium_retry | %s", url[:50])
+                driver.get(url)
+
             driver.save_screenshot(str(screenshot_path))
-            driver.quit()
-            
-            logger.info("screenshot_captured | url=%s | path=%s", url[:50], screenshot_filename)
+
+            logger.info(
+                "screenshot_selenium_success | file=%s",
+                screenshot_path.name
+            )
+
             return str(screenshot_path)
-            
+
         except Exception as e:
-            logger.error("screenshot_capture_failed_selenium | error=%s", str(e))
+            logger.error(
+                "screenshot_selenium_failed | %s | %s",
+                url[:50],
+                str(e)
+            )
             return None
-    
+
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
+
+    # ======================
+    # Main
+    # ======================
     @staticmethod
     def capture(url: str) -> Optional[str]:
-        """
-        Capture website screenshot with fallback strategies.
-        
-        Args:
-            url: URL to capture
-            
-        Returns:
-            str: Path to screenshot file or None
-        """
         try:
-            # Try Playwright first
+            # ưu tiên playwright
             if PLAYWRIGHT_AVAILABLE:
                 result = ScreenshotService.capture_with_playwright(url)
                 if result:
                     return result
-            
-            # Fallback to Selenium
+
+            # fallback selenium
             if SELENIUM_AVAILABLE:
                 result = ScreenshotService.capture_with_selenium(url)
                 if result:
                     return result
-            
+
             logger.warning("no_screenshot_engine_available")
             return None
-            
+
         except Exception as e:
-            logger.error("screenshot_service_error | error=%s", str(e))
+            logger.error("screenshot_service_error | %s", str(e))
             return None
 
 
+# ==========================
+# Helper
+# ==========================
+
 def capture_website(url: str) -> Optional[str]:
-    """
-    Convenience function to capture website screenshot.
-    
-    Args:
-        url: URL to capture
-        
-    Returns:
-        str: Path to screenshot file or None
-    """
     return ScreenshotService.capture(url)

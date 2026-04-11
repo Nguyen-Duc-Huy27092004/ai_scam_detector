@@ -1,130 +1,153 @@
 import re
-import math
 from urllib.parse import urlparse, parse_qs
-from typing import Dict, Any, Optional
-from bs4 import BeautifulSoup
-from utils.logger import logger
 
 
 class URLFeatureExtractor:
 
-    SUSPICIOUS_KEYWORDS = {
-        'update', 'verify', 'confirm', 'account', 'bank', 'secure',
-        'login', 'password', 'urgent', 'action', 'click', 'alert',
-        'wallet', 'payment', 'invoice', 'refund'
-    }
-
-    SUSPICIOUS_TLDS = {
-        'tk', 'ml', 'ga', 'cf', 'xyz', 'top', 'win', 'review'
+    SUSPICIOUS_WORDS = {
+        "login", "verify", "bank", "account",
+        "secure", "update", "confirm", "password",
+        "urgent", "action", "alert", "click"
     }
 
     @staticmethod
-    def _shannon_entropy(s: str) -> float:
-        if not s:
-            return 0.0
-        prob = [float(s.count(c)) / len(s) for c in dict.fromkeys(list(s))]
-        return -sum(p * math.log2(p) for p in prob)
+    def extract_features(url: str):
 
-    @staticmethod
-    def extract_features(url: str, html_content: Optional[str] = None) -> Dict[str, Any]:
-        try:
-            parsed = urlparse(url)
-            domain = parsed.netloc.lower()
-            path = parsed.path.lower()
-            query = parsed.query.lower()
+        parsed = urlparse(url)
 
-            features = {}
-            signals = []
+        hostname = parsed.netloc.lower()
+        path = parsed.path
+        query = parsed.query
 
-            # Basic
-            features['url_length'] = len(url)
-            features['domain_length'] = len(domain)
-            features['path_length'] = len(path)
-            features['subdomain_count'] = domain.count('.') - 1
-            features['digit_count'] = sum(c.isdigit() for c in url)
-            features['special_char_count'] = len(re.findall(r'[!@#$%^&*()_+=\[\]{};:,.<>?/]', url))
-            features['entropy'] = URLFeatureExtractor._shannon_entropy(domain)
+        features = {}
 
-            # HTTPS
-            features['has_https'] = 1 if parsed.scheme == 'https' else 0
-            if features['has_https'] == 0:
-                signals.append("Website không dùng HTTPS")
+        # ==========================
+        # Basic structure
+        # ==========================
 
-            # IP address
-            ip_pattern = r'\d+\.\d+\.\d+\.\d+'
-            features['has_ip_address'] = 1 if re.fullmatch(ip_pattern, domain) else 0
-            if features['has_ip_address']:
-                signals.append("URL sử dụng địa chỉ IP")
+        features["NumDots"] = url.count(".")
+        features["SubdomainLevel"] = max(hostname.count(".") - 1, 0)
+        features["PathLevel"] = path.count("/")
+        features["UrlLength"] = len(url)
 
-            # TLD
-            tld = domain.split('.')[-1]
-            features['suspicious_tld'] = 1 if tld in URLFeatureExtractor.SUSPICIOUS_TLDS else 0
-            if features['suspicious_tld']:
-                signals.append("TLD đáng ngờ")
+        features["NumDash"] = url.count("-")
+        features["NumDashInHostname"] = hostname.count("-")
 
-            # Keywords
-            domain_kw = sum(1 for k in URLFeatureExtractor.SUSPICIOUS_KEYWORDS if k in domain)
-            path_kw = sum(1 for k in URLFeatureExtractor.SUSPICIOUS_KEYWORDS if k in path)
-            query_kw = sum(1 for k in URLFeatureExtractor.SUSPICIOUS_KEYWORDS if k in query)
+        features["AtSymbol"] = 1 if "@" in url else 0
+        features["TildeSymbol"] = 1 if "~" in url else 0
+        features["NumUnderscore"] = url.count("_")
+        features["NumPercent"] = url.count("%")
 
-            features['suspicious_domain_words'] = domain_kw
-            features['suspicious_path_words'] = path_kw
-            features['suspicious_query_words'] = query_kw
+        features["NumQueryComponents"] = len(parse_qs(query))
+        features["NumAmpersand"] = url.count("&")
+        features["NumHash"] = url.count("#")
 
-            if domain_kw + path_kw + query_kw > 0:
-                signals.append("URL chứa từ khóa lừa đảo")
+        features["NumNumericChars"] = sum(c.isdigit() for c in url)
 
-            # Query params
-            features['query_param_count'] = len(parse_qs(query))
+        features["NoHttps"] = 1 if parsed.scheme != "https" else 0
 
-            # HTML-based features
-            features['has_form'] = 0
-            features['has_password_input'] = 0
-            features['external_link_ratio'] = 0
+        # ==========================
+        # Random string detection (entropy nhẹ)
+        # ==========================
 
-            if html_content:
-                soup = BeautifulSoup(html_content, "html.parser")
-                forms = soup.find_all("form")
-                features['has_form'] = 1 if forms else 0
-                if forms:
-                    signals.append("Trang web có form nhập liệu")
+        def entropy(s):
+            import math
+            prob = [float(s.count(c)) / len(s) for c in set(s)]
+            return -sum(p * math.log2(p) for p in prob)
 
-                password_inputs = soup.find_all("input", {"type": "password"})
-                features['has_password_input'] = 1 if password_inputs else 0
-                if password_inputs:
-                    signals.append("Trang web yêu cầu nhập mật khẩu")
+        features["RandomString"] = 1 if entropy(hostname) > 3.5 else 0
 
-                links = soup.find_all("a", href=True)
-                external = [a for a in links if domain not in a['href']]
-                if links:
-                    features['external_link_ratio'] = len(external) / len(links)
+        # ==========================
+        # IP address
+        # ==========================
 
-            features["_signals"] = signals
+        ip_pattern = r"^\d{1,3}(\.\d{1,3}){3}$"
+        features["IpAddress"] = 1 if re.match(ip_pattern, hostname) else 0
 
-            logger.debug("url_features_extracted | url=%s", url[:60])
-            return features
+        # ==========================
+        # Domain tricks
+        # ==========================
 
-        except Exception as e:
-            logger.error("feature_extraction_failed | error=%s", str(e))
-            return {"url_length": len(url), "_signals": []}
+        features["DomainInSubdomains"] = 1 if hostname.count(".") > 2 else 0
+        features["DomainInPaths"] = 1 if hostname in path else 0
+        features["HttpsInHostname"] = 1 if "https" in hostname else 0
+
+        # ==========================
+        # Lengths
+        # ==========================
+
+        features["HostnameLength"] = len(hostname)
+        features["PathLength"] = len(path)
+        features["QueryLength"] = len(query)
+
+        features["DoubleSlashInPath"] = 1 if "//" in path else 0
+
+        # ==========================
+        # Suspicious words
+        # ==========================
+
+        features["NumSensitiveWords"] = sum(
+            1 for w in URLFeatureExtractor.SUSPICIOUS_WORDS
+            if w in url.lower()
+        )
+
+        features["EmbeddedBrandName"] = 0  # cần list brand mới làm được
+
+        # ==========================
+        # Những feature cần HTML → set default
+        # ==========================
+
+        features["PctExtHyperlinks"] = 0
+        features["PctExtResourceUrls"] = 0
+        features["ExtFavicon"] = 0
+        features["InsecureForms"] = 0
+        features["RelativeFormAction"] = 0
+        features["ExtFormAction"] = 0
+        features["AbnormalFormAction"] = 0
+        features["PctNullSelfRedirectHyperlinks"] = 0
+        features["FrequentDomainNameMismatch"] = 0
+        features["FakeLinkInStatusBar"] = 0
+        features["RightClickDisabled"] = 0
+        features["PopUpWindow"] = 0
+        features["SubmitInfoToEmail"] = 0
+        features["IframeOrFrame"] = 0
+        features["MissingTitle"] = 0
+        features["ImagesOnlyInForm"] = 0
+
+        # ==========================
+        # RT features (tạm set 0)
+        # ==========================
+
+        features["SubdomainLevelRT"] = 0
+        features["UrlLengthRT"] = 0
+        features["PctExtResourceUrlsRT"] = 0
+        features["AbnormalExtFormActionR"] = 0
+        features["ExtMetaScriptLinkRT"] = 0
+        features["PctExtNullSelfRedirectHyperlinksRT"] = 0
+
+        return features
 
     @staticmethod
     def get_feature_names():
         return [
-            'url_length', 'domain_length', 'path_length', 'subdomain_count',
-            'digit_count', 'special_char_count', 'entropy', 'has_https',
-            'has_ip_address', 'suspicious_tld',
-            'suspicious_domain_words', 'suspicious_path_words',
-            'suspicious_query_words', 'query_param_count',
-            'has_form', 'has_password_input', 'external_link_ratio'
+            "NumDots","SubdomainLevel","PathLevel","UrlLength","NumDash",
+            "NumDashInHostname","AtSymbol","TildeSymbol","NumUnderscore",
+            "NumPercent","NumQueryComponents","NumAmpersand","NumHash",
+            "NumNumericChars","NoHttps","RandomString","IpAddress",
+            "DomainInSubdomains","DomainInPaths","HttpsInHostname",
+            "HostnameLength","PathLength","QueryLength","DoubleSlashInPath",
+            "NumSensitiveWords","EmbeddedBrandName","PctExtHyperlinks",
+            "PctExtResourceUrls","ExtFavicon","InsecureForms",
+            "RelativeFormAction","ExtFormAction","AbnormalFormAction",
+            "PctNullSelfRedirectHyperlinks","FrequentDomainNameMismatch",
+            "FakeLinkInStatusBar","RightClickDisabled","PopUpWindow",
+            "SubmitInfoToEmail","IframeOrFrame","MissingTitle",
+            "ImagesOnlyInForm","SubdomainLevelRT","UrlLengthRT",
+            "PctExtResourceUrlsRT","AbnormalExtFormActionR",
+            "ExtMetaScriptLinkRT","PctExtNullSelfRedirectHyperlinksRT"
         ]
 
     @staticmethod
-    def get_feature_vector(features: Dict[str, Any]) -> list:
-        vector = []
-        for name in URLFeatureExtractor.get_feature_names():
-            value = features.get(name, 0)
-            if isinstance(value, bool):
-                value = 1 if value else 0
-            vector.append(value)
-        return vector
+    def get_feature_vector(features: dict):
+
+        return [features.get(name, 0) for name in URLFeatureExtractor.get_feature_names()]

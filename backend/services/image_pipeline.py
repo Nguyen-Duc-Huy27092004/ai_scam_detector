@@ -11,9 +11,11 @@ from utils.logger import logger, log_analysis_result
 from ml.image.predict_image import predict_image
 from ml.text.text_classifier import classify_text
 from ocr.ocr_engine import extract_text_from_image
-from services.risk_level import calculate_image_risk
+from services.risk_level import calculate_risk
 from services.advisor import generate_advice, get_recommendations
-from database.analysis_history import AnalysisHistory
+from ml.url.db import AnalysisHistory
+from llm.llm_explainer import generate_explanation
+
 
 
 class ImageAnalysisPipeline:
@@ -72,10 +74,14 @@ class ImageAnalysisPipeline:
             
             # Step 4: Risk Calculation
             logger.debug("step_4: risk_calculation")
-            risk_level, overall_score = calculate_image_risk(
-                image_confidence=image_confidence,
-                ocr_text_risk=text_risk_score
+            # FIX: calculate_risk() signature uses url_ml_confidence/image_risk/text_risk
+            # (not image_confidence/ocr_text_risk). Also returns 3-tuple (level, score, meta).
+            risk_level, overall_score, _ = calculate_risk(
+                url_ml_confidence=image_confidence,
+                image_risk=image_confidence,
+                text_risk=text_risk_score,
             )
+            risk_level = risk_level.lower()  # FIX: normalize to lowercase for advisor templates
             result['steps_completed'].append('risk_calculation')
             result['risk_level'] = risk_level
             result['overall_score'] = overall_score
@@ -89,10 +95,31 @@ class ImageAnalysisPipeline:
                 'image', risk_level, risk_factors, image_confidence
             )
             recommendations = get_recommendations(risk_level, 'image')
+
+            # 🔥 AI Explanation Step
+            # FIX: generate_explanation() accepts a single dict, NOT positional args.
+            # risk_factors is already gathered above at this point.
+            llm_exp = generate_explanation({
+                "overall_score": overall_score,
+                "risk_level": risk_level,
+                "risk_factors": risk_factors,
+                "scam_type": "image_scam",
+                "confidence": image_confidence,
+                "content_summary": ocr_text[:500] if ocr_text else "",
+            })
+            result['llm_explanation'] = llm_exp
+
+            if 'analysis_summary' in llm_exp:
+                advice_text = advice.get('advice', '')
+                advice_text += f"\n\n🤖 AI NHẬN XÉT:\n{llm_exp['analysis_summary']}\n\n👉 KHUYÊN DÙNG: {llm_exp['recommended_action']}"
+                if isinstance(advice, dict):
+                    advice['advice'] = advice_text
+
             result['steps_completed'].append('advice_generated')
             result['advice'] = advice
             result['recommendations'] = recommendations
             result['risk_factors'] = risk_factors
+
             
             # Step 6: Save to Database
             logger.debug("step_6: database_save")
@@ -103,17 +130,18 @@ class ImageAnalysisPipeline:
                 'risk_factors': risk_factors
             }, default=str)
             
-            record_id = AnalysisHistory.create(
-                input_type='image',
-                input_value=image_path,
-                label=image_label,
-                risk_level=risk_level,
-                confidence=image_confidence,
-                advice=advice,
-                screenshot_path=image_path,
-                ocr_text=ocr_text,
-                evidence_json=evidence_json
-            )
+            record_id = AnalysisHistory.create({
+                "input_type": "image",
+                "input_value": image_path,
+                "label": image_label,
+                "risk_level": risk_level,
+                "confidence": image_confidence,
+                "advice": str(advice),
+                "screenshot_path": image_path,
+                "ocr_text": ocr_text,
+                "evidence_json": evidence_json,
+                "model_version": "2.0",
+            })
             result['record_id'] = record_id
             result['steps_completed'].append('database_saved')
             

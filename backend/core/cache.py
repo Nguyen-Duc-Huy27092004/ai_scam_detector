@@ -1,0 +1,45 @@
+import json
+from datetime import timedelta
+from typing import Any, Optional
+
+import redis.asyncio as redis
+from utils.config import REDIS_URL
+from utils.logger import logger
+
+class CacheManager:
+    def __init__(self):
+        self.redis_client = None
+
+    async def init(self):
+        try:
+            self.redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+            await self.redis_client.ping()
+            logger.info("Connected to Redis cache successfully.")
+        except Exception as e:
+            logger.error(f"Failed to connect to Redis cache: {e}")
+            self.redis_client = None
+
+    async def get(self, key: str) -> Optional[Any]:
+        if not self.redis_client:
+            return None
+        try:
+            val = await self.redis_client.get(key)
+            if val:
+                return json.loads(val)
+        except Exception as e:
+            logger.error(f"Redis get error: {e}")
+        return None
+
+    async def set(self, key: str, value: Any, expire_seconds: int = 86400):
+        if not self.redis_client:
+            return
+        try:
+            await self.redis_client.set(key, json.dumps(value), ex=expire_seconds)
+        except Exception as e:
+            logger.error(f"Redis set error: {e}")
+
+    async def close(self):
+        if self.redis_client:
+            await self.redis_client.close()
+
+cache = CacheManager()

@@ -1,6 +1,6 @@
 from typing import List
-from backend.ml.text.analyzer import analyze_text
-from backend.entities.scam_evidence import ScamEvidence
+from ml.text.analyzer import analyze_text
+from entities.scam_evidence import ScamEvidence
 
 
 _SEVERITY_MAP = {

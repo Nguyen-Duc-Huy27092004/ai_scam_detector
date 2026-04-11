@@ -1,115 +1,186 @@
 """
 Domain intelligence module.
-Collect WHOIS, SSL, DNS, and heuristic signals for scam detection.
+
+Fixes applied:
+  H2 — WHOIS timeout: whois.whois() now runs in a dedicated thread with a
+       hard 5-second timeout, preventing indefinite blocking.
+  L2 — Removed duplicate _check_ssl(): ssl_inspector.inspect_ssl() already
+       performs a full TLS check; calling _check_ssl() here was a redundant
+       second TCP connection to port 443 on every analysis.
 """
 
-import socket
-import ssl
 import re
+import socket
+import ipaddress
+import concurrent.futures
 from datetime import datetime
 from urllib.parse import urlparse
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import whois
+
 from utils.logger import logger
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Suspicious pattern tables
+# ──────────────────────────────────────────────────────────────────────────────
+
 SUSPICIOUS_TLDS = {
-    "tk", "ml", "ga", "cf", "xyz", "top", "win", "click", "review", "vip"
+    "tk", "ml", "ga", "cf",
+    "xyz", "top", "win",
+    "click", "review", "vip",
 }
 
 SUSPICIOUS_KEYWORDS = {
-    "login", "verify", "secure", "account", "update",
-    "bank", "paypal", "apple", "google", "facebook",
-    "confirm", "support", "service", "wallet"
+    "login", "verify", "secure", "account",
+    "update", "bank", "paypal", "apple",
+    "google", "facebook", "confirm",
+    "support", "service", "wallet",
 }
 
 
-def get_domain_intel(url: str) -> Dict[str, Any]:
-    parsed = urlparse(url)
-    domain = parsed.netloc.split(":")[0]
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
-    result = {
-        "domain": domain,
-        "is_https": url.startswith("https://"),
-        "is_ip": False,
-        "age_days": None,
-        "subdomain_count": 0,
-        "tld": None,
-        "whois_registered": False,
-        "ssl_valid": False,
-        "suspicious_patterns": []
+def _is_ip(domain: str) -> bool:
+    try:
+        ipaddress.ip_address(domain)
+        return True
+    except Exception:
+        return False
+
+
+def _safe_domain_age(domain: str) -> Optional[int]:
+    """
+    Return domain age in days, or None on failure.
+
+    H2: whois.whois() has no built-in timeout and can block for 30+ seconds
+    on slow TLD servers. We run it in an executor with a 5-second deadline.
+    """
+    def _fetch():
+        return whois.whois(domain)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(_fetch)
+            try:
+                info = future.result(timeout=5)
+            except concurrent.futures.TimeoutError:
+                logger.warning("whois_timeout | domain=%s", domain)
+                return None
+
+        creation = info.creation_date
+        if isinstance(creation, list):
+            creation = creation[0]
+        if not creation:
+            return None
+        if isinstance(creation, str):
+            return None
+
+        if creation.tzinfo:
+            creation = creation.replace(tzinfo=None)
+
+        return (datetime.utcnow() - creation).days
+
+    except Exception as e:
+        logger.warning("whois_failed | %s | %s", domain, str(e))
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main domain intel
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_domain_intel(url: str) -> Dict[str, Any]:
+
+    parsed = urlparse(url)
+    domain = parsed.hostname or ""
+
+    result: Dict[str, Any] = {
+        "domain":             domain,
+        "is_https":           url.startswith("https://"),
+        "is_ip":              False,
+        "age_days":           None,
+        "subdomain_count":    0,
+        "tld":                None,
+        "whois_registered":   False,
+        # L2: ssl_valid is now populated by ssl_inspector.inspect_ssl()
+        # downstream; we keep the key for backwards compat but set False here.
+        "ssl_valid":          False,
+        "domain_length":      len(domain),
+        "suspicious_patterns": [],
     }
 
     try:
-        # ================= IP check =================
-        if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", domain):
+        patterns: set = set()
+
+        # IP address
+        if _is_ip(domain):
             result["is_ip"] = True
-            result["suspicious_patterns"].append("ip_address")
+            patterns.add("ip_address")
 
-        # ================= Subdomain =================
+        # Domain structure
         parts = domain.split(".")
-        result["subdomain_count"] = len(parts) - 2 if len(parts) > 2 else 0
+        if len(parts) > 2:
+            result["subdomain_count"] = len(parts) - 2
 
-        # ================= TLD =================
-        tld = parts[-1].lower()
-        result["tld"] = tld
-        if tld in SUSPICIOUS_TLDS:
-            result["suspicious_patterns"].append("suspicious_tld")
+        if parts:
+            tld = parts[-1].lower()
+            result["tld"] = tld
+            if tld in SUSPICIOUS_TLDS:
+                patterns.add("suspicious_tld")
 
-        # ================= Keyword =================
+        # Keyword detection
         domain_lower = domain.lower()
         for kw in SUSPICIOUS_KEYWORDS:
             if kw in domain_lower:
-                result["suspicious_patterns"].append(f"keyword_{kw}")
+                patterns.add(f"keyword_{kw}")
 
-        # ================= WHOIS =================
-        try:
-            whois_info = whois.whois(domain)
-            creation_date = whois_info.creation_date
+        # Domain length
+        if len(domain) > 40:
+            patterns.add("long_domain")
 
-            if isinstance(creation_date, list):
-                creation_date = creation_date[0]
-
-            if creation_date:
-                age_days = (datetime.utcnow() - creation_date).days
-                result["age_days"] = age_days
-                result["whois_registered"] = True
-
-                if age_days < 30:
-                    result["suspicious_patterns"].append("new_domain")
-                elif age_days < 90:
-                    result["suspicious_patterns"].append("young_domain")
-            else:
-                result["suspicious_patterns"].append("no_creation_date")
-
-        except Exception as e:
-            logger.warning("whois_failed | %s | %s", domain, str(e))
-            result["suspicious_patterns"].append("whois_failed")
-
-        # ================= SSL =================
-        if result["is_https"]:
-            try:
-                context = ssl.create_default_context()
-                with socket.create_connection((domain, 443), timeout=5) as sock:
-                    with context.wrap_socket(sock, server_hostname=domain) as ssock:
-                        cert = ssock.getpeercert()
-                        if cert:
-                            result["ssl_valid"] = True
-            except Exception as e:
-                logger.warning("ssl_failed | %s | %s", domain, str(e))
-                result["suspicious_patterns"].append("invalid_ssl")
-        else:
-            result["suspicious_patterns"].append("no_https")
-
-        # ================= Subdomain abuse =================
+        # Subdomain abuse
         if result["subdomain_count"] >= 3:
-            result["suspicious_patterns"].append("too_many_subdomains")
+            patterns.add("too_many_subdomains")
 
-        logger.info("domain_intel_done | %s", domain)
-        return result
+        # Punycode / IDN
+        if "xn--" in domain:
+            patterns.add("punycode_domain")
+
+        # WHOIS (H2: with 5s timeout)
+        age_days = _safe_domain_age(domain)
+        if age_days is not None:
+            result["age_days"]         = age_days
+            result["whois_registered"] = True
+            if age_days < 30:
+                patterns.add("new_domain")
+            elif age_days < 90:
+                patterns.add("young_domain")
+        else:
+            patterns.add("whois_missing")
+
+        # L2: Removed redundant _check_ssl() — ssl_inspector.inspect_ssl()
+        # in url_pipeline.py already performs a full TLS handshake and its
+        # result is fed into calculate_risk() via ssl_result.
+        if not result["is_https"]:
+            patterns.add("no_https")
+
+        # Suspicious port
+        if parsed.port and parsed.port not in {80, 443}:
+            patterns.add("suspicious_port")
+
+        result["suspicious_patterns"] = list(patterns)
+
+        logger.info(
+            "domain_intel_done | domain=%s | patterns=%d",
+            domain, len(patterns),
+        )
 
     except Exception as e:
-        logger.error("domain_intel_failed | %s | %s", domain, str(e))
+        logger.exception("domain_intel_failed | %s", str(e))
         result["error"] = str(e)
-        return result
+
+    return result

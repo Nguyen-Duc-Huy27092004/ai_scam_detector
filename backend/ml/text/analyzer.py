@@ -1,9 +1,9 @@
 import re
 from typing import Dict, Any, List, Tuple
 
-# ========================
+#######################
 # Scam patterns (VI + EN)
-# ========================
+#######################
 
 _SCAM_PATTERNS_VI = [
     (r"(?i)xác\s*minh\s*tài\s*khoản", "verify_account"),
@@ -32,10 +32,9 @@ _SCAM_PATTERNS_EN = [
 
 _ALL_PATTERNS = _SCAM_PATTERNS_VI + _SCAM_PATTERNS_EN
 
-
-# ========================
+#######################
 # Pattern scoring
-# ========================
+#######################
 def _pattern_score(flags: List[str]) -> float:
     weights = {
         "urgent_action": 0.35,
@@ -52,9 +51,9 @@ def _pattern_score(flags: List[str]) -> float:
     return min(1.0, sum(weights.get(f, 0.15) for f in flags))
 
 
-# ========================
+#######################
 # Analyzer core
-# ========================
+#######################
 def analyze_text(text: str) -> Dict[str, Any]:
     if not text or not isinstance(text, str):
         return {

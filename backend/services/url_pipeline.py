@@ -1,165 +1,301 @@
-import json
-from typing import Dict, Any, Optional, Tuple
-from utils.logger import logger, log_analysis_result
-from ml.url.predict import predict_url
-from services.screenshot import capture_website
-from services.content_extractor import extract_from_url, extract_metadata
+"""
+URL Analysis Pipeline — Production Hardened (Improved Stability + Observability)
+"""
+
+import atexit
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Any, List
+from urllib.parse import urlparse
+import time
+
+from utils.logger import logger
+
+from services.async_crawler import SecureCrawler
 from services.domain_intel import get_domain_intel
-from services.risk_level import calculate_url_risk
-from services.advisor import generate_advice, get_recommendations
-from database.analysis_history import AnalysisHistory
+from services.risk_level import calculate_risk
+from services.advisor import generate_advice
+from services.redirect_analyzer import analyze_redirects
+from services.dataset_checker import DatasetChecker
+from services.network_analyzer import NetworkAnalyzer
+from services.brand_detector import detect_brand_impersonation
+from services.content_extractor import ContentExtractor
+from services.file_analyzer import FileAnalyzer
+from services.screenshot import ScreenshotService
+
+from ml.url.predict import predict_url
+from llm.llm_explainer import generate_explanation
+
+
+# ========================
+# SINGLETONS
+# ========================
+_dataset_checker = DatasetChecker()
+
+# ========================
+# EXECUTOR
+# ========================
+_EXECUTOR = ThreadPoolExecutor(max_workers=8)
+atexit.register(lambda: _EXECUTOR.shutdown(wait=False))
+
+
+def _safe_future(name: str, future, timeout=8):
+    start = time.time()
+    try:
+        result = future.result(timeout=timeout)
+        elapsed = time.time() - start
+        logger.info("future_done | %s | %.2fs", name, elapsed)
+        return result if result is not None else {}
+    except Exception as e:
+        elapsed = time.time() - start
+        logger.warning("future_fail | %s | %.2fs | %s", name, elapsed, str(e))
+        return {}
+
+
+# ========================
+# CONTENT HEURISTICS
+# ========================
+_SCAM_KEYWORDS: List[tuple] = [
+    ("otp", 0.30), ("mã xác nhận", 0.25), ("chuyển tiền", 0.30),
+    ("nạp tiền", 0.25), ("trúng thưởng", 0.30),
+    ("verify now", 0.20), ("click here", 0.10),
+    ("urgent", 0.15), ("đăng nhập", 0.15),
+]
+
+
+def _score_content(text: str, metadata: dict) -> tuple:
+    score = 0.0
+    factors: List[str] = []
+
+    if text:
+        t = text.lower()
+        for kw, w in _SCAM_KEYWORDS:
+            if kw in t:
+                score += w
+                factors.append(f"keyword_{kw.replace(' ', '_')}")
+
+    if metadata.get("has_login_form"):
+        score += 0.2
+        factors.append("login_form")
+
+    if metadata.get("has_otp_field"):
+        score += 0.35
+        factors.append("otp_request")
+
+    if metadata.get("urgency_phrases"):
+        score += 0.15
+        factors.append("urgency_detected")
+
+    return min(score, 1.0), factors
+
+
+def _fallback_explanation(score, risk_level, risk_factors, confidence):
+    return {
+        "risk_score": round(score, 2),
+        "risk_level": risk_level,
+        "confidence_note": f"Confidence: {int(confidence * 100)}%",
+        "risk_assessment": "Fallback heuristic analysis",
+        "detected_signals": risk_factors[:5],
+        "recommended_actions": [
+            "Không nhập thông tin cá nhân",
+            "Xác minh domain trước khi truy cập"
+        ],
+        "website_summary": "LLM unavailable"
+    }
 
 
 class URLAnalysisPipeline:
 
     @staticmethod
     def analyze(url: str) -> Dict[str, Any]:
-        logger.info("url_analysis_started | url=%s", url[:100])
+        start_total = time.time()
 
         try:
-            # 1. ML prediction
-            ml_result = predict_url(url)
-            confidence = ml_result.get("confidence", 0.0)
+            # ========================
+            # 1. REDIRECT
+            # ========================
+            redirect_info = analyze_redirects(url) or {}
+            final_url = redirect_info.get("final_url") or url
 
-            # 2. Domain intel
-            domain_intel = get_domain_intel(url)
+            if not SecureCrawler.is_safe_url(final_url):
+                return {"status": "error", "message": "Unsafe URL"}
 
-            # 3. Content
-            html, text = extract_from_url(url)
-            metadata = extract_metadata(html) if html else {}
+            domain = urlparse(final_url).netloc
 
-            # 4. Screenshot
-            screenshot_path = capture_website(url)
+            # ========================
+            # 2. BLACKLIST
+            # ========================
+            try:
+                blacklist = _dataset_checker.check_url(final_url)
+            except Exception as e:
+                logger.warning("blacklist_fail | %s", str(e))
+                blacklist = {"is_blacklisted": False}
 
-            # 5. Content analysis
-            content_score, content_flags, scam_type = URLAnalysisPipeline._analyze_content(text, metadata)
+            # ========================
+            # 3. PARALLEL TASKS
+            # ========================
+            futures = {
+                "crawl": _EXECUTOR.submit(SecureCrawler.crawl_sync, final_url),
+                "intel": _EXECUTOR.submit(get_domain_intel, final_url),
+                "network": _EXECUTOR.submit(NetworkAnalyzer.analyze, final_url),
+                "brand": _EXECUTOR.submit(detect_brand_impersonation, domain),
+                "screenshot": _EXECUTOR.submit(
+                    ScreenshotService.capture_with_playwright, final_url
+                ),
+            }
 
-            # 6. Risk score
-            risk_level, overall_score = calculate_url_risk(
-                phishing_confidence=confidence,
-                domain_age_days=domain_intel.get("age_days"),
-                is_https=domain_intel.get("is_https"),
-                suspicious_patterns=domain_intel.get("suspicious_patterns"),
-                content_score=content_score
-            )
+            crawl = _safe_future("crawl", futures["crawl"], 10)
+            intel = _safe_future("intel", futures["intel"], 6)
+            network = _safe_future("network", futures["network"], 6)
+            brand = _safe_future("brand", futures["brand"], 5)
+            screenshot_path = _safe_future("screenshot", futures["screenshot"], 12) or None
 
-            # 7. Risk factors
-            risk_factors = URLAnalysisPipeline._gather_risk_factors(
-                domain_intel, ml_result, content_flags
-            )
+            html = crawl.get("html", "")
+            text = crawl.get("text", "")
 
-            is_scam = overall_score >= 0.7
+            # ========================
+            # 4. CONTENT
+            # ========================
+            metadata = {}
+            if html:
+                try:
+                    metadata = ContentExtractor.extract_metadata(html, base_url=final_url)
+                except Exception as e:
+                    logger.warning("metadata_fail | %s", str(e))
 
-            advice = generate_advice("url", risk_level, risk_factors, confidence)
-            recommendations = get_recommendations(risk_level, "url")
+            content_score, content_factors = _score_content(text, metadata)
 
-            summary = "Website có dấu hiệu lừa đảo" if is_scam else "Website có vẻ an toàn"
+            # ========================
+            # 5. ML
+            # ========================
+            ml = predict_url(final_url) or {}
+            confidence = float(ml.get("confidence", 0.01))
 
-            evidence_json = json.dumps({
-                "domain_intel": domain_intel,
-                "ml_prediction": ml_result,
-                "metadata": metadata,
-                "risk_factors": risk_factors,
-                "scam_type": scam_type
-            }, default=str)
+            # ========================
+            # 6. FILE ANALYSIS
+            # ========================
+            file_risk = 0.0
+            if html and len(html) < 2_000_000:
+                try:
+                    file_result = FileAnalyzer.analyze(html.encode(), "page.html")
+                    if file_result.get("suspicious"):
+                        file_risk = 0.8
+                except Exception as e:
+                    logger.debug("file_analysis_skip | %s", str(e))
 
-            record_id = AnalysisHistory.create(
-                input_type="url",
-                input_value=url,
-                label="scam" if is_scam else "safe",
-                risk_level=risk_level,
-                confidence=confidence,
-                advice=advice,
-                screenshot_path=screenshot_path,
-                ocr_text=None,
-                evidence_json=evidence_json
-            )
+            # ========================
+            # 7. SIGNAL AGGREGATION
+            # ========================
+            patterns = []
+            patterns.extend(network.get("risk_flags", []))
+            patterns.extend(content_factors)
 
+            if brand.get("is_impersonating"):
+                patterns.append("brand_impersonation")
+
+            if blacklist.get("is_blacklisted"):
+                patterns.append("blacklisted")
+
+            patterns = list(set(patterns))[:15]
+
+            # ========================
+            # 8. RISK
+            # ========================
+            try:
+                risk_level, score, _ = calculate_risk(
+                    url_ml_confidence=confidence,
+                    domain_age_days=intel.get("age_days"),
+                    is_https=final_url.startswith("https"),
+                    suspicious_patterns=patterns,
+                    text_risk=max(content_score, file_risk),
+                    image_risk=0.0,
+                    domain=domain,
+                    is_blacklisted=blacklist.get("is_blacklisted", False),
+                )
+            except Exception as e:
+                logger.error("risk_calc_fail | %s", str(e))
+                risk_level, score = "low", 0.0
+
+            risk_level = str(risk_level or "low").lower()
+            score = float(score or 0.0)
+
+            if blacklist.get("is_blacklisted"):
+                score = max(score, 85.0)
+                risk_level = "high"
+
+            # ========================
+            # 9. LLM (with timeout)
+            # ========================
+            llm = _fallback_explanation(score, risk_level, patterns, confidence)
+            try:
+                # Run LLM with 30-second timeout to prevent pipeline blocking
+                llm_future = _EXECUTOR.submit(generate_explanation, {
+                    "overall_score": score,
+                    "risk_level": risk_level,
+                    "risk_factors": patterns[:10],
+                    "confidence": confidence,
+                    "domain": domain,
+                    "content_summary": text[:500] if text else ""
+                })
+                llm = _safe_future("llm", llm_future, timeout=30)
+                if not llm:  # If timeout or error, keep fallback
+                    llm = _fallback_explanation(score, risk_level, patterns, confidence)
+            except Exception as e:
+                logger.warning("llm_fail | %s", str(e))
+                # llm already has fallback value
+
+            # ========================
+            # 10. ADVISOR
+            # ========================
+            try:
+                advice = generate_advice(
+                    analysis_type="url",
+                    risk_level=risk_level,
+                    risk_factors=patterns,
+                    confidence=confidence
+                )
+            except Exception as e:
+                logger.error("advice_fail | %s", str(e))
+                advice = {}
+
+            total_time = time.time() - start_total
+            logger.info("pipeline_done | %.2fs | %s", total_time, final_url[:80])
+
+            # ========================
+            # RESULT
+            # ========================
             return {
                 "status": "completed",
-                "url": url,
-                "is_scam": is_scam,
+                "url": final_url,
+                "final_url": final_url,
+
                 "risk_level": risk_level,
-                "overall_score": overall_score,
-                "confidence": confidence,
-                "scam_type": scam_type,
-                "summary": summary,
-                "risk_factors": risk_factors,
-                "metadata": metadata,
+                "overall_score": round(score, 2),
+                "confidence": round(confidence, 4),
+                "is_scam": score > 70,
+
+                "risk_factors": patterns,
+
+                "page_metadata": {
+                    "title": metadata.get("title"),
+                    "has_login_form": metadata.get("has_login_form", False),
+                    "has_otp_field": metadata.get("has_otp_field", False),
+                },
+
+                "network": {
+                    "risk_flags": network.get("risk_flags", []),
+                    "ssl_valid": network.get("ssl", {}).get("valid"),
+                },
+
                 "screenshot_path": screenshot_path,
+
+                "llm_explanation": llm,
                 "advice": advice,
-                "recommendations": recommendations,
-                "record_id": record_id
             }
 
         except Exception as e:
-            logger.exception("url_analysis_failed | %s", str(e))
-            return {"status": "error", "error": str(e)}
-
-    # ==============================
-    # Content reasoning (not keyword only)
-    # ==============================
-    @staticmethod
-    def _analyze_content(text: Optional[str], metadata: dict) -> Tuple[float, list, str]:
-        score = 0.0
-        flags = []
-        scam_type = "unknown"
-
-        if not text:
-            return score, flags, scam_type
-
-        t = text.lower()
-
-        if any(x in t for x in ["verify account", "login now", "reset password"]):
-            score += 0.3
-            flags.append("credential_request")
-            scam_type = "banking_phishing"
-
-        if any(x in t for x in ["transfer money", "send money", "payment now"]):
-            score += 0.4
-            flags.append("money_request")
-            scam_type = "financial_scam"
-
-        if any(x in t for x in ["you won", "lottery", "prize"]):
-            score += 0.3
-            flags.append("lottery_scam")
-            scam_type = "lottery_scam"
-
-        if any(x in t for x in ["urgent", "act now", "limited time"]):
-            score += 0.2
-            flags.append("urgency_language")
-
-        forms = metadata.get("forms", [])
-        if forms:
-            score += 0.2
-            flags.append("login_form_detected")
-
-        return min(score,1.0), flags, scam_type
-
-    # ==============================
-    # Risk factors explainable
-    # ==============================
-    @staticmethod
-    def _gather_risk_factors(domain_intel: dict, ml_result: dict, content_flags: list) -> list:
-        factors = []
-
-        if not domain_intel.get("is_https"):
-            factors.append("Không có HTTPS")
-
-        if domain_intel.get("age_days") and domain_intel["age_days"] < 30:
-            factors.append("Domain mới đăng ký")
-
-        if domain_intel.get("is_ip"):
-            factors.append("Sử dụng IP thay vì tên miền")
-
-        if ml_result.get("confidence",0) > 0.7:
-            factors.append("ML phát hiện nguy cơ cao")
-
-        for f in content_flags:
-            factors.append(f)
-
-        return factors
+            logger.exception("pipeline_fail | %s", str(e))
+            return {"status": "error", "message": str(e)}
 
 
-def analyze_url(url: str) -> Dict[str, Any]:
+def analyze_url(url: str) -> dict:
     return URLAnalysisPipeline.analyze(url)
