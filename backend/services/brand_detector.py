@@ -59,7 +59,9 @@ def is_official_domain(domain: str, brand: str) -> bool:
 
 
 def is_fake_subdomain(domain: str, brand: str) -> bool:
-    return brand in domain and not domain.endswith(brand + ".com")
+    if is_official_domain(domain, brand):
+        return False
+    return brand in domain
 
 
 def contains_punycode(domain: str) -> bool:

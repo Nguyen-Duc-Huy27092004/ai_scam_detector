@@ -23,10 +23,13 @@ class TextScamClassifier:
 
             confidence = min(1.0, score)
 
-            if confidence >= 0.7:
+            high_t = float(TEXT_SCAM_CONFIDENCE_THRESHOLD)
+            med_t = high_t * 0.57
+
+            if confidence >= high_t:
                 risk_level = "high"
                 is_scam = True
-            elif confidence >= 0.4:
+            elif confidence >= med_t:
                 risk_level = "medium"
                 is_scam = False
             else:

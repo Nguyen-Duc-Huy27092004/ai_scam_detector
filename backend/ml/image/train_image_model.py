@@ -1,107 +1,139 @@
 """
 Train image scam detection model (ResNet18).
+Run from any CWD: paths are resolved relative to this file.
 """
 
-import os
+from __future__ import annotations
+
 import json
+import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader
 from sklearn.metrics import classification_report, confusion_matrix
+from torch.utils.data import DataLoader
+from torchvision import datasets, models, transforms
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "../../data/images")
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+DATA_DIR = BASE_DIR / "data" / "images"
 
-TRAIN_DIR = os.path.join(DATA_DIR, "train")
-TEST_DIR = os.path.join(DATA_DIR, "test")
+TRAIN_DIR = DATA_DIR / "train"
+TEST_DIR = DATA_DIR / "test"
 
-MODEL_DIR = os.path.join(BASE_DIR, "../../models/image_model")
-os.makedirs(MODEL_DIR, exist_ok=True)
+MODEL_DIR = BASE_DIR / "models" / "image_model"
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-MODEL_PATH = os.path.join(MODEL_DIR, "scam_image_model.pth")
-LABELS_PATH = os.path.join(MODEL_DIR, "labels.json")
+MODEL_PATH = MODEL_DIR / "scam_image_model.pth"
+LABELS_PATH = MODEL_DIR / "labels.json"
 
 IMG_SIZE = 224
 BATCH_SIZE = 32
 EPOCHS = 15
 LR = 1e-4
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
+IMAGENET_NORM = transforms.Normalize(
+    mean=[0.485, 0.456, 0.406],
+    std=[0.229, 0.224, 0.225],
+)
 
-train_transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(10),
-    transforms.ToTensor()
-])
 
-test_transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ToTensor()
-])
+def main() -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
 
-train_dataset = datasets.ImageFolder(TRAIN_DIR, transform=train_transform)
-test_dataset = datasets.ImageFolder(TEST_DIR, transform=test_transform)
+    train_transform = transforms.Compose(
+        [
+            transforms.Resize((IMG_SIZE, IMG_SIZE)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(10),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.ToTensor(),
+            IMAGENET_NORM,
+        ]
+    )
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+    test_transform = transforms.Compose(
+        [
+            transforms.Resize((IMG_SIZE, IMG_SIZE)),
+            transforms.ToTensor(),
+            IMAGENET_NORM,
+        ]
+    )
 
-labels = {str(v): k for k, v in train_dataset.class_to_idx.items()}
-with open(LABELS_PATH, "w", encoding="utf-8") as f:
-    json.dump(labels, f, indent=4, ensure_ascii=False)
+    train_dataset = datasets.ImageFolder(str(TRAIN_DIR), transform=train_transform)
+    test_dataset = datasets.ImageFolder(str(TEST_DIR), transform=test_transform)
 
-num_classes = len(labels)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
 
-model = models.resnet18(pretrained=True)
-for param in model.parameters():
-    param.requires_grad = False
+    labels = {str(v): k for k, v in train_dataset.class_to_idx.items()}
+    with open(LABELS_PATH, "w", encoding="utf-8") as f:
+        json.dump(labels, f, indent=4, ensure_ascii=False)
 
-model.fc = nn.Linear(model.fc.in_features, num_classes)
-model.to(device)
+    num_classes = len(labels)
 
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.fc.parameters(), lr=LR)
+    try:
+        weights_enum = models.ResNet18_Weights.DEFAULT
+        model = models.resnet18(weights=weights_enum)
+    except AttributeError:
+        model = models.resnet18(pretrained=True)
 
-for epoch in range(EPOCHS):
-    model.train()
-    total, correct, loss_sum = 0, 0, 0
+    for param in model.parameters():
+        param.requires_grad = False
 
-    for images, targets in train_loader:
-        images, targets = images.to(device), targets.to(device)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    model.to(device)
 
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, targets)
-        loss.backward()
-        optimizer.step()
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.fc.parameters(), lr=LR)
 
-        loss_sum += loss.item()
-        _, preds = torch.max(outputs, 1)
-        total += targets.size(0)
-        correct += (preds == targets).sum().item()
+    for epoch in range(EPOCHS):
+        model.train()
+        total, correct, loss_sum = 0, 0, 0
 
-    acc = 100 * correct / total
-    print(f"Epoch {epoch+1}/{EPOCHS} | Loss={loss_sum:.4f} | Acc={acc:.2f}%")
+        for images, targets in train_loader:
+            images, targets = images.to(device), targets.to(device)
 
-model.eval()
-all_preds, all_labels = [], []
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
 
-with torch.no_grad():
-    for images, targets in test_loader:
-        images, targets = images.to(device), targets.to(device)
-        outputs = model(images)
-        _, preds = torch.max(outputs, 1)
+            loss_sum += loss.item()
+            _, preds = torch.max(outputs, 1)
+            total += targets.size(0)
+            correct += (preds == targets).sum().item()
 
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(targets.cpu().numpy())
+        acc = 100 * correct / total
+        print(f"Epoch {epoch + 1}/{EPOCHS} | Loss={loss_sum:.4f} | Acc={acc:.2f}%")
 
-print("Confusion Matrix:")
-print(confusion_matrix(all_labels, all_preds))
-print(classification_report(all_labels, all_preds, target_names=train_dataset.classes))
+    model.eval()
+    all_preds, all_labels = [], []
 
-torch.save(model.state_dict(), MODEL_PATH)
-print("Model saved:", MODEL_PATH)
-print("Labels saved:", LABELS_PATH)
+    with torch.no_grad():
+        for images, targets in test_loader:
+            images, targets = images.to(device), targets.to(device)
+            outputs = model(images)
+            _, preds = torch.max(outputs, 1)
+
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(targets.cpu().numpy())
+
+    print("Confusion Matrix:")
+    print(confusion_matrix(all_labels, all_preds))
+    print(
+        classification_report(
+            all_labels, all_preds, target_names=train_dataset.classes
+        )
+    )
+
+    torch.save(model.state_dict(), MODEL_PATH)
+    print("Model saved:", MODEL_PATH)
+    print("Labels saved:", LABELS_PATH)
+
+
+if __name__ == "__main__":
+    main()

@@ -29,10 +29,13 @@ WEIGHTS = {
 }
 
 RISK_THRESHOLDS = {
-    "LOW":      20,
-    "MEDIUM":   45,
-    "HIGH":     70,
-    # >= 70 → CRITICAL
+    # score < 20 -> LOW
+    # 20 <= score < 45 -> MEDIUM
+    # 45 <= score < 70 -> HIGH
+    # score >= 70 -> CRITICAL
+    "MEDIUM_MIN": 20,
+    "HIGH_MIN": 45,
+    "CRITICAL_MIN": 70,
 }
 
 TRUSTED_DOMAINS = [
@@ -178,13 +181,38 @@ def calculate_pattern_score(patterns: List[str]) -> float:
 # ============================
 
 def determine_risk_level(score: float) -> str:
-    if score >= RISK_THRESHOLDS["HIGH"]:
+    if score >= RISK_THRESHOLDS["CRITICAL_MIN"]:
         return "CRITICAL"
-    if score >= RISK_THRESHOLDS["MEDIUM"]:
+    if score >= RISK_THRESHOLDS["HIGH_MIN"]:
         return "HIGH"
-    if score >= RISK_THRESHOLDS["LOW"]:
+    if score >= RISK_THRESHOLDS["MEDIUM_MIN"]:
         return "MEDIUM"
     return "LOW"
+
+
+# ============================
+# TEXT-ONLY HELPERS
+# ============================
+
+def calculate_text_risk(
+    text_confidence: float,
+    suspicious_patterns: Optional[List[str]] = None,
+) -> Tuple[str, float, Dict]:
+    """
+    Risk scoring for plain-text analysis only.
+    Do not pass text ML confidence as url_ml_confidence — that applies URL-tuned weights.
+    """
+    tc = max(0.0, min(float(text_confidence or 0), 1.0))
+    return calculate_risk(
+        url_ml_confidence=0.0,
+        image_risk=0.0,
+        text_risk=tc,
+        domain_age_days=None,
+        is_https=True,
+        suspicious_patterns=suspicious_patterns,
+        domain="",
+        is_blacklisted=False,
+    )
 
 
 # ============================
@@ -314,11 +342,11 @@ def calculate_risk(
         # ─── Final Score (anti-false-positive smoothing) ──────────────────────
         final_score = (score * 0.85) + (ml_score * 0.15)
 
-        # Suppress low ML models from producing very high scores
-        if url_ml_confidence < 0.15 and final_score < 40 and not bl_hit:
+        # Suppress low URL ML confidence from producing very high scores (skip when no URL ML signal)
+        if 0 < url_ml_confidence < 0.15 and final_score < 40 and not bl_hit:
             final_score = min(final_score, 25.0)
 
-        if final_score > 92 and url_ml_confidence < 0.4 and not bl_hit:
+        if final_score > 92 and 0 < url_ml_confidence < 0.4 and not bl_hit:
             final_score = 88.0
 
         final_score = max(0.0, min(round(final_score, 2), 100.0))

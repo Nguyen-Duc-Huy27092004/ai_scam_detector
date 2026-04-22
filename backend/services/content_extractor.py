@@ -10,6 +10,7 @@ Web content extraction service (PRODUCTION READY)
 from typing import Tuple, Optional, Dict
 from urllib.parse import urlparse, urljoin
 
+from services.async_crawler import SecureCrawler
 from utils.logger import logger
 from utils.config import USER_AGENT, CONTENT_EXTRACTION_TIMEOUT
 
@@ -44,6 +45,7 @@ class ContentExtractor:
 
     MAX_HTML_SIZE = 2_000_000
     MAX_TEXT_LENGTH = 5000
+    MAX_BUTTON_TEXTS = 30
 
     UNWANTED_TAGS = [
         "script", "style", "meta", "link", "noscript", "iframe"
@@ -58,6 +60,9 @@ class ContentExtractor:
 
         if not WEB_AVAILABLE:
             logger.warning("web_tools_not_available")
+            return None, None
+        if not SecureCrawler.is_safe_url(url):
+            logger.warning("ssrf_blocked_extractor | url=%s", url[:80])
             return None, None
 
         try:
@@ -284,6 +289,8 @@ class ContentExtractor:
 
             # Buttons
             for btn in soup.find_all(["button", "a"]):
+                if len(metadata["button_texts"]) >= ContentExtractor.MAX_BUTTON_TEXTS:
+                    break
                 txt = (btn.get_text(strip=True) or "").lower()
                 if txt and len(txt) < 100:
                     metadata["button_texts"].append(txt)

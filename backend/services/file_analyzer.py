@@ -6,6 +6,8 @@ from utils.logger import logger
 
 
 class FileAnalyzer:
+    BENIGN_EXTS = {"pdf", "doc", "docx", "xls", "xlsx", "jpg", "jpeg", "png", "txt"}
+    DANGEROUS_EXTS = {"exe", "bat", "cmd", "ps1", "sh", "vbs", "jar", "scr", "com"}
 
     # ========================
     # MAGIC BYTES DETECTION
@@ -56,7 +58,11 @@ class FileAnalyzer:
     @staticmethod
     def _has_double_extension(filename: str) -> bool:
         parts = filename.lower().split(".")
-        return len(parts) > 2
+        if len(parts) <= 2:
+            return False
+        second_last_ext = parts[-2]
+        last_ext = parts[-1]
+        return second_last_ext in FileAnalyzer.BENIGN_EXTS and last_ext in FileAnalyzer.DANGEROUS_EXTS
 
     # ========================
     # SUSPICIOUS STRINGS

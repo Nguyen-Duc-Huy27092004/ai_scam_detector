@@ -91,7 +91,7 @@ class OCREngine:
                     conf_value = float(conf)
                     if conf_value > 0:
                         confidences.append(conf_value)
-                except:
+                except (ValueError, TypeError):
                     continue
 
             avg_confidence = sum(confidences) / len(confidences) if confidences else 0

@@ -13,6 +13,7 @@ import re
 import socket
 import ipaddress
 import concurrent.futures
+import atexit
 from datetime import datetime
 from urllib.parse import urlparse
 from typing import Dict, Any, Optional
@@ -20,6 +21,10 @@ from typing import Dict, Any, Optional
 import whois
 
 from utils.logger import logger
+
+
+_WHOIS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+atexit.register(lambda: _WHOIS_EXECUTOR.shutdown(wait=False))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -63,13 +68,12 @@ def _safe_domain_age(domain: str) -> Optional[int]:
         return whois.whois(domain)
 
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(_fetch)
-            try:
-                info = future.result(timeout=5)
-            except concurrent.futures.TimeoutError:
-                logger.warning("whois_timeout | domain=%s", domain)
-                return None
+        future = _WHOIS_EXECUTOR.submit(_fetch)
+        try:
+            info = future.result(timeout=5)
+        except concurrent.futures.TimeoutError:
+            logger.warning("whois_timeout | domain=%s", domain)
+            return None
 
         creation = info.creation_date
         if isinstance(creation, list):

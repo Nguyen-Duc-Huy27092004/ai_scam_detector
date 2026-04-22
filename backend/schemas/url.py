@@ -1,8 +1,12 @@
-from pydantic import BaseModel, HttpUrl
-from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any
+
 
 class URLAnalyzeRequest(BaseModel):
-    url: str
+    """Request body for URL / deep analysis endpoints."""
+
+    url: str = Field(..., min_length=1, description="Full URL to analyze")
+
 
 class URLAnalyzeResponse(BaseModel):
     success: bool

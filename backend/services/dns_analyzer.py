@@ -140,10 +140,10 @@ def analyze_dns(url: str) -> dict:
         result["suspicious_signals"].append("no_nameservers")
 
     if not result["has_spf"]:
-        logger.info("dns_no_spf | domain=%s", domain)
+        logger.debug("dns_no_spf | domain=%s", domain)
 
     if not result["has_dmarc"]:
-        logger.info("dns_no_dmarc | domain=%s", domain)
+        logger.debug("dns_no_dmarc | domain=%s", domain)
 
     # Suspicious nameservers
     _SUSPICIOUS_NS = ["freenom", "afraid.org", "no-ip"]

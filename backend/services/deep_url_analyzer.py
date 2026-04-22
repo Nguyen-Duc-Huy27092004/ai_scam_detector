@@ -220,7 +220,15 @@ def run_deep_analysis(base_result: dict):
     deep = DeepURLAnalyzer.analyze(html, url)
 
     # Merge with base (deep enhances, not replaces)
-    merged_score = max(base_result.get("overall_score", 0), deep["overall_score"])
+    base_score = base_result.get("overall_score", 0)
+    try:
+        base_score = float(base_score or 0)
+    except (TypeError, ValueError):
+        base_score = 0.0
+    if 0 < base_score <= 1.0:
+        base_score *= 100.0
+
+    merged_score = max(base_score, deep["overall_score"])
 
     return {
         "overall_score": merged_score,

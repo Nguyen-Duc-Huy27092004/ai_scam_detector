@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from services.async_crawler import SecureCrawler
 from utils.logger import logger
 from utils.config import SCREENSHOTS_DIR, SCREENSHOT_TIMEOUT, USER_AGENT
 
@@ -73,7 +74,8 @@ class ScreenshotService:
                 # retry 1 lần nếu fail
                 try:
                     page.goto(url, timeout=SCREENSHOT_TIMEOUT * 1000)
-                except:
+                except Exception as e:
+                    logger.warning("playwright_retry | %s", str(e))
                     page.goto(url, timeout=SCREENSHOT_TIMEOUT * 2000)
 
                 page.wait_for_timeout(1000)
@@ -130,8 +132,8 @@ class ScreenshotService:
 
             try:
                 driver.get(url)
-            except:
-                logger.warning("selenium_retry | %s", url[:50])
+            except Exception as e:
+                logger.warning("selenium_retry | %s | %s", url[:50], str(e))
                 driver.get(url)
 
             driver.save_screenshot(str(screenshot_path))
@@ -155,8 +157,8 @@ class ScreenshotService:
             if driver:
                 try:
                     driver.quit()
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug("selenium_quit_failed | %s", str(e))
 
     # ======================
     # Main
@@ -164,6 +166,9 @@ class ScreenshotService:
     @staticmethod
     def capture(url: str) -> Optional[str]:
         try:
+            if not SecureCrawler.is_safe_url(url):
+                logger.warning("ssrf_screenshot_blocked | url=%s", url[:80])
+                return None
             # ưu tiên playwright
             if PLAYWRIGHT_AVAILABLE:
                 result = ScreenshotService.capture_with_playwright(url)

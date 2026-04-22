@@ -4,7 +4,7 @@ Style inspired by chongluadao.vn
 Rule-based explanation engine (no external LLM).
 """
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 
 # ==============================
@@ -122,7 +122,7 @@ def generate_text_advice(
 def generate_url_advice(
     risk_level: str,
     risk_factors: List[str],
-    domain_info: Dict[str, Any] = None,
+    domain_info: Optional[Dict[str, Any]] = None,
     scam_type: str = "unknown"
 ) -> Dict[str, Any]:
 
@@ -165,7 +165,7 @@ def generate_final_advice(
     risk_level: str,
     flags: List[str],
     scam_type: str = "unknown",
-    domain_info: Dict[str, Any] = None
+    domain_info: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Unified advice generator for text / url / image

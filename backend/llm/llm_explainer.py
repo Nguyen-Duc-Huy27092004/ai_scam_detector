@@ -46,12 +46,11 @@ LLM_REQUEST_TIMEOUT = (LLM_CONNECT_TIMEOUT, LLM_READ_TIMEOUT)
 def _create_session():
     """Create a configured requests session with connection pooling."""
     session = requests.Session()
-    # Disable keep-alive to avoid connection reuse issues
-    session.headers.update({"Connection": "close"})
+    # Let connection pooling work naturally
     # Configure connection pooling
     adapter = requests.adapters.HTTPAdapter(
-        pool_connections=10,
-        pool_maxsize=10,
+        pool_connections=20,
+        pool_maxsize=20,
         max_retries=0,  # let our retry logic handle it
     )
     session.mount("http://", adapter)
@@ -105,28 +104,49 @@ def _record_failure():
 # PROMPT
 # ==========================
 
+def _determine_tone(score: int) -> str:
+    """Select prompt tone directive based on risk score."""
+    if score >= 80:
+        return "CẢNH BÁO MẠNH: Trang này rất nguy hiểm. Dùng giọng nghiêm trọng, khẩn cấp."
+    elif score >= 50:
+        return "THẬN TRỌNG: Trang này đáng ngờ. Dùng giọng cảnh giác nhưng bình tĩnh."
+    return "THÔNG TIN: Trang này có vẻ an toàn. Dùng giọng nhẹ nhàng, hướng dẫn."
+
+
 def build_explanation_prompt(meta: dict) -> str:
-    # Lấy thông tin đối tượng phân tích
-    target = meta.get("domain") or meta.get("title") or "Không rõ"
-    content_summary = meta.get("content_summary", "")[:800] if meta.get("content_summary") else "Không có nội dung."
-    
-    return f"""Bạn là chuyên gia an ninh mạng. Phân tích nhanh.
+    features = meta.get("metadata", {})
+    score = meta.get("overall_score", 0)
+    risk_level = meta.get("risk_level", "unknown")
+    domain = meta.get("domain", "unknown")
+    factors = ", ".join(meta.get("risk_factors", [])[:5]) or "none"
+    tone = _determine_tone(int(score))
 
-=== WEBSITE ===
-URL: {target}
-Nội dung: {content_summary}
-Risk score: {meta.get("overall_score", 0)}/100
-ML confidence: {meta.get("confidence", 0):.1%}
-Dấu hiệu: {", ".join(meta.get("risk_factors", [])[:5])}
+    return f"""Bạn là chuyên gia bảo mật giải thích cho người dùng bình thường.
 
-Trả về CHÍNH XÁC JSON này (không text bên ngoài):
+{tone}
+
+Tín hiệu phát hiện từ trang [{domain}]:
+- Form đăng nhập: {features.get('has_login_form', False)}
+- Form gửi ra ngoài: {features.get('has_external_form', False)}
+- Ô nhập mật khẩu: {features.get('password_inputs', 0)}
+- Liên kết ngoài: {features.get('external_links', 0)}
+- Cụm từ gấp: {features.get('urgency', [])}
+- Từ khóa nghi vấn: {features.get('keywords', [])}
+- Dấu hiệu rủi ro: {factors}
+- Điểm rủi ro: {score}/100
+
+Quy tắc:
+- Viết ngắn, rõ, không dùng thuật ngữ kỹ thuật
+- Tập trung vào hậu quả nếu người dùng tiếp tục
+- Đưa hành động cụ thể
+
+Trả về ĐÚNG JSON (không text ngoài):
 {{
-  "risk_score": {meta.get("overall_score", 0)},
-  "risk_level": "safe",
-  "detected_signals": [],
-  "website_summary": "Mô tả ngắn 2-3 dòng",
-  "analysis_summary": "Kết luận 2-3 dòng",
-  "recommended_action": "Khuyến nghị 1 dòng"
+  "risk_level": "low | medium | high",
+  "analysis_summary": "2-3 câu giải thích đơn giản",
+  "impact": "Hậu quả nếu tiếp tục",
+  "confidence_note": "Lý do kết luận dựa trên dấu hiệu",
+  "recommended_action": "Hành động cụ thể"
 }}"""
 
 
@@ -158,8 +178,9 @@ def call_llm(prompt: str) -> Optional[str]:
                             "prompt": prompt,
                             "stream": False,
                             "options": {
-                                "temperature": 0.1,  # Lower for consistency
-                                "num_predict": 500,  # Limit tokens for speedup
+                                "temperature": 0.1,
+                                "num_predict": 256,
+                                "num_ctx": 1024,
                                 "top_k": 40,
                                 "top_p": 0.9,
                             },
@@ -190,7 +211,7 @@ def call_llm(prompt: str) -> Optional[str]:
                             "model": LLM_MODEL,
                             "messages": [{"role": "user", "content": prompt}],
                             "temperature": 0.1,
-                            "max_tokens": 500,  # Faster response
+                            "max_tokens": 200,
                         },
                         timeout=LLM_REQUEST_TIMEOUT,
                     )
@@ -302,8 +323,10 @@ def _normalize(data: dict, fallback: dict) -> dict:
         "risk_score": data.get("risk_score", fallback["score"]),
         "risk_level": data.get("risk_level", fallback["risk_level"]),
         "detected_signals": data.get("detected_signals", fallback["factors"][:5]),
-        "website_summary": data.get("website_summary") or "Không rõ nội dung.",
         "analysis_summary": data.get("analysis_summary") or "Không có phân tích.",
+        "website_summary": data.get("website_summary", "Không có thông tin website."),
+        "impact": data.get("impact") or "Chưa xác định được hậu quả cụ thể.",
+        "confidence_note": data.get("confidence_note") or "Dựa trên các tín hiệu tự động.",
         "recommended_action": data.get("recommended_action") or "Hãy cẩn trọng.",
     }
 
@@ -346,7 +369,8 @@ def generate_explanation(meta: dict) -> dict:
         "risk_score": score,
         "risk_level": risk_level,
         "detected_signals": factors[:5],
-        "website_summary": "Không thể phân tích đầy đủ.",
-        "analysis_summary": "LLM không phản hồi hoặc lỗi.",
+        "analysis_summary": "Hệ thống chưa thể đưa ra đánh giá chi tiết.",
+        "impact": "Chưa xác định. Hãy thận trọng khi tương tác.",
+        "confidence_note": "Phân tích tự động dựa trên các dấu hiệu kỹ thuật.",
         "recommended_action": "Không nên tin tưởng, hãy kiểm tra thủ công.",
     }

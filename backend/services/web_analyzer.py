@@ -1,17 +1,42 @@
-from typing import Dict, Any, Optional
+from typing import Dict, Any
+import warnings
 
-from backend.ml.url.feature_extraction import url_features_for_evidence
-from backend.ml.url.predict import predict_url
-from backend.services.domain_intel import get_domain_intel
-from backend.services.content_extractor import extract_from_url
-from backend.services.screenshot import capture_website
-from backend.services.content_analyzer import analyze_content
-from backend.services.risk_level import calculate_risk
-from backend.services.advisor import generate_advice
-from backend.utils.logger import logger
+from ml.url.feature_extraction import URLFeatureExtractor
+from ml.url.predict import predict_url
+from services.domain_intel import get_domain_intel
+from services.content_extractor import extract_from_url
+from services.screenshot import capture_website
+from services.content_analyzer import analyze_content
+from services.risk_level import calculate_risk
+from services.advisor import generate_advice
+from utils.logger import logger
+
+
+def _content_score_and_flags(text: str) -> tuple[float, list]:
+    evidences = analyze_content(text)
+    if not evidences:
+        return 0.0, []
+
+    flags = []
+    severity_weights = {"low": 0.25, "medium": 0.6, "high": 1.0}
+    weighted_sum = 0.0
+    for ev in evidences:
+        flag = getattr(ev, "flag_name", None) or getattr(ev, "keyword", "")
+        if flag:
+            flags.append(flag)
+        sev = str(getattr(ev, "severity", "low")).lower()
+        weighted_sum += severity_weights.get(sev, 0.3)
+
+    score = min(1.0, weighted_sum / max(len(evidences), 1))
+    return score, list(dict.fromkeys(flags))
 
 
 def analyze_url(url: str) -> Dict[str, Any]:
+    warnings.warn(
+        "web_analyzer.analyze_url() is deprecated. Use url_pipeline.analyze_url() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     url = url.strip()
     evidence: Dict[str, Any] = {
         "url_features": {},
@@ -24,7 +49,7 @@ def analyze_url(url: str) -> Dict[str, Any]:
     domain_info = get_domain_intel(url)
     evidence["domain_info"] = domain_info
 
-    url_feat = url_features_for_evidence(url)
+    url_feat = URLFeatureExtractor.extract_features(url)
     evidence["url_features"] = url_feat
 
     try:
@@ -44,9 +69,7 @@ def analyze_url(url: str) -> Dict[str, Any]:
     try:
         _, html_text = extract_from_url(url)
         if html_text:
-            content_result = analyze_content(html_text)
-            content_score = content_result["score"]
-            content_flags = content_result.get("flags") or []
+            content_score, content_flags = _content_score_and_flags(html_text)
             evidence["content_flags"] = content_flags
             evidence["content_preview"] = html_text[:500].strip()
     except Exception as e:
@@ -58,24 +81,24 @@ def analyze_url(url: str) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("screenshot_failed | url=%s | error=%s", url[:80], str(e))
 
-    prediction = ml_result["prediction"]
-    confidence = ml_result["confidence"]
-    label = ml_result["label"]
+    confidence = float(ml_result.get("confidence", 0.0))
+    label = ml_result.get("label", "safe")
+    domain_patterns = domain_info.get("suspicious_patterns", [])
 
-    risk_level = calculate_risk(
-        prediction=prediction,
-        confidence=confidence,
-        content_score=content_score,
-        domain_info=domain_info,
-        content_flags=content_flags,
+    risk_level, _, _ = calculate_risk(
+        url_ml_confidence=confidence,
+        text_risk=content_score,
+        domain_age_days=domain_info.get("age_days"),
+        is_https=url.startswith("https://"),
+        suspicious_patterns=(domain_patterns + content_flags),
+        domain=domain_info.get("domain", ""),
     )
 
     ai_advice = generate_advice(
-        label=label,
+        analysis_type="url",
         risk_level=risk_level,
-        evidence=evidence,
+        risk_factors=(domain_patterns + content_flags),
         confidence=confidence,
-        input_repr=url,
     )
 
     return {

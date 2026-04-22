@@ -62,7 +62,7 @@ def _build_url_response(url: str, result: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "url":               url,
-        "is_scam":           bool(result.get("is_scam", overall_score >= 70)),
+        "is_scam":           bool(result.get("is_scam")),
         "risk_score":        overall_score,
         "risk_score_percent": overall_score,
         "risk_level":        risk_level,
@@ -132,6 +132,14 @@ async def analyze(request: Request, payload: URLAnalyzeRequest):
         return URLAnalyzeResponse(
             success=False,
             error="Invalid URL format",
+            timestamp=datetime.utcnow().isoformat() + "Z"
+        )
+
+    if not is_safe_url(url):
+        logger.warning("analyze_ssrf_blocked | url=%s", url[:100])
+        return URLAnalyzeResponse(
+            success=False,
+            error="URL resolves to a private or reserved address",
             timestamp=datetime.utcnow().isoformat() + "Z"
         )
 
@@ -212,7 +220,13 @@ async def deep_analyze(request: Request, payload: DeepAnalyzeRequest):
     cached = await cache.get(cache_key)
     if cached:
         logger.info("url_deep_analyze_cache_hit | %s", url[:120])
-        return {"success": True, "data": cached, "timestamp": datetime.utcnow().isoformat() + "Z"}
+        return JSONResponse(
+            content={
+                "success": True,
+                "data": cached,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            }
+        )
 
     # Fetch HTML via SecureCrawler (SSRF + size safe)
     logger.info("deep_analyze_crawl_start | url=%s", url[:120])
@@ -226,8 +240,11 @@ async def deep_analyze(request: Request, payload: DeepAnalyzeRequest):
         logger.error("deep_analyze_crawl_exception | url=%s | error=%s", url[:120], str(e))
         return JSONResponse(
             status_code=502,
-            content={"success": False, "error": f"Failed to fetch website: {str(e)}",
-                     "timestamp": datetime.utcnow().isoformat() + "Z"}
+            content={
+                "success": False,
+                "error": "Failed to fetch website",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            },
         )
     
     logger.info("deep_analyze_crawl_result | success=%s | has_html=%s", 
@@ -253,8 +270,11 @@ async def deep_analyze(request: Request, payload: DeepAnalyzeRequest):
         logger.error("deep_analysis_failed | url=%s | error=%s", url[:120], str(e), exc_info=True)
         return JSONResponse(
             status_code=500,
-            content={"success": False, "error": f"Deep analysis failed: {str(e)}",
-                     "timestamp": datetime.utcnow().isoformat() + "Z"}
+            content={
+                "success": False,
+                "error": "Deep analysis failed",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            },
         )
 
     # Parse HTML for title / snippet
@@ -321,8 +341,10 @@ async def deep_analyze(request: Request, payload: DeepAnalyzeRequest):
     # Cache for 1 hour
     await cache.set(cache_key, response_data, expire_seconds=3600)
 
-    return {
-        "success":   True,
-        "data":      response_data,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-    }
+    return JSONResponse(
+        content={
+            "success": True,
+            "data": response_data,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+    )

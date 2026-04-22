@@ -19,6 +19,7 @@ import asyncio
 import random
 import socket
 import ipaddress
+import ssl as ssl_module
 from typing import Optional, Dict, Any
 from urllib.parse import urlparse, urljoin
 
@@ -26,6 +27,8 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 from utils.logger import logger
+
+_SSL_CONTEXT = ssl_module.create_default_context()
 
 
 class SecureCrawler:
@@ -188,7 +191,7 @@ class SecureCrawler:
     async def crawl(cls, url: str) -> Dict[str, Any]:
         """Crawl a URL and return structured result dict."""
         connector = aiohttp.TCPConnector(
-            ssl=False,
+            ssl=_SSL_CONTEXT,
             limit=10,
             ttl_dns_cache=300,
         )

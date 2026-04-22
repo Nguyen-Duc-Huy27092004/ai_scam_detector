@@ -3,16 +3,36 @@ Text analysis pipeline orchestrator.
 Coordinates text scam analysis workflow.
 """
 
+import hashlib
 import json
-from typing import Dict, Any
+from typing import Any, Dict
 
 from utils.logger import logger, log_analysis_result
 from ml.text.text_classifier import classify_text, TextScamClassifier
-from services.risk_level import calculate_risk
+from services.risk_level import calculate_text_risk
 from services.advisor import generate_advice, get_recommendations
 from ml.url.db import AnalysisHistory
 from llm.llm_explainer import generate_explanation
+from utils.config import TEXT_MODEL_VERSION
 
+
+def _merge_llm_into_advice(advice: Any, llm_exp: Dict[str, Any]) -> Any:
+    """Append LLM summary without mutating shared template dicts or mixing list/str types."""
+    if "analysis_summary" not in llm_exp:
+        return advice
+    addendum = (
+        f"\n\n🤖 AI NHẬN XÉT:\n{llm_exp['analysis_summary']}"
+        f"\n\n👉 KHUYẾN NGHỊ: {llm_exp.get('recommended_action', '')}"
+    )
+    if isinstance(advice, dict):
+        advice = dict(advice)
+        existing = advice.get("advice", "")
+        if isinstance(existing, list):
+            advice["advice"] = list(existing) + [addendum]
+        else:
+            advice["advice"] = str(existing) + addendum
+        return advice
+    return str(advice) + addendum
 
 
 class TextAnalysisPipeline:
@@ -43,8 +63,8 @@ class TextAnalysisPipeline:
             result['keywords'] = keywords
             result['steps_completed'].append('keywords_extracted')
 
-            # Step 3: Risk Calculation
-            risk_level, overall_score, _ = calculate_risk(url_ml_confidence=text_confidence)
+            # Step 3: Risk Calculation (text-specific — do not feed text score as URL ML)
+            risk_level, overall_score, _ = calculate_text_risk(text_confidence)
             risk_level = risk_level.lower()
 
             result['risk_level'] = risk_level
@@ -68,38 +88,34 @@ class TextAnalysisPipeline:
             result['llm_explanation'] = llm_exp
 
             if 'analysis_summary' in llm_exp:
-                # Merge or replace static advice with AI advice
-                advice_text = advice.get('advice', '') if isinstance(advice, dict) else str(advice)
-                advice_text += f"\n\n🤖 AI NHẬN XÉT:\n{llm_exp['analysis_summary']}\n\n👉 KHUYÊN DÙNG: {llm_exp['recommended_action']}"
-                if isinstance(advice, dict):
-                    advice['advice'] = advice_text
-                else:
-                    advice = advice_text
+                advice = _merge_llm_into_advice(advice, llm_exp)
 
             result['advice'] = advice
             result['recommendations'] = recommendations
             result['risk_factors'] = risk_factors
             result['steps_completed'].append('advice_generated')
 
-
-            # Step 5: Save to Database
+            # Step 5: Save to Database (minimize PII: preview + hash only)
             evidence_json = json.dumps({
                 'classification': classification,
                 'keywords': keywords,
                 'risk_factors': risk_factors
             }, default=str)
 
+            input_preview = (text[:100] + "...") if text and len(text) > 100 else (text or "")
+            input_hash = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+
             record = {
                 "input_type": "text",
-                "input_value": text[:500],
+                "input_value": f"{input_preview} | h={input_hash}",
                 "label": text_label,
                 "risk_level": risk_level,
                 "confidence": text_confidence,
-                "advice": advice,
+                "advice": advice if isinstance(advice, str) else json.dumps(advice, default=str, ensure_ascii=False),
                 "screenshot_path": None,
-                "ocr_text": text,
+                "ocr_text": None,
                 "evidence_json": evidence_json,
-                "model_version": "text-v1"
+                "model_version": TEXT_MODEL_VERSION,
             }
 
             record_id = AnalysisHistory.create(record)
@@ -122,9 +138,10 @@ class TextAnalysisPipeline:
 
     @staticmethod
     def _gather_risk_factors(classification: dict) -> list:
-        factors = []
-        factors.extend(classification.get('flags', []))
-        factors.extend(classification.get('patterns', []))
+        factors = list(classification.get('flags', []))
+        for pat_name, _pat_text in classification.get('patterns', []):
+            if pat_name not in factors:
+                factors.append(pat_name)
         return factors
 
 

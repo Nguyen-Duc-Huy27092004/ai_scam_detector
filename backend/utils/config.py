@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import json
 
 # ========================
 # Base directories
@@ -51,6 +52,14 @@ IMAGE_LABELS_PATH = MODELS_DIR / "image_model" / "labels.json"
 
 URL_MODEL_PATH = MODELS_DIR / "phishing_detector.pkl"
 URL_SCALER_PATH = MODELS_DIR / "scaler.pkl"
+
+# Optional SHA-256 (hex) for joblib models — set in production to detect tampering.
+URL_MODEL_SHA256 = os.getenv("URL_MODEL_SHA256", "").strip()
+URL_SCALER_SHA256 = os.getenv("URL_SCALER_SHA256", "").strip()
+
+URL_MODEL_VERSION = os.getenv("URL_MODEL_VERSION", "2.0")
+TEXT_MODEL_VERSION = os.getenv("TEXT_MODEL_VERSION", "text-v1")
+IMAGE_MODEL_VERSION = os.getenv("IMAGE_MODEL_VERSION", "2.0")
 
 # ========================
 # Limits
@@ -118,6 +127,11 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 
 # ========================
+# Internal ops (optional — unset disables /api/health/internal)
+# ========================
+INTERNAL_HEALTH_TOKEN = os.getenv("INTERNAL_HEALTH_TOKEN", "").strip()
+
+# ========================
 # Cleanup
 # ========================
 SCREENSHOT_MAX_AGE_HOURS = int(os.getenv("SCREENSHOT_MAX_AGE_HOURS", "24"))
@@ -125,3 +139,15 @@ SCREENSHOT_MAX_AGE_HOURS = int(os.getenv("SCREENSHOT_MAX_AGE_HOURS", "24"))
 # Content extraction
 # ========================
 CONTENT_EXTRACTION_TIMEOUT = 10
+
+
+def validate_image_labels_file(path: Path, name: str = "image_model") -> None:
+    """Ensure labels JSON exists and is non-empty (avoids silent Keras/Torch failure)."""
+    if not path.exists():
+        raise FileNotFoundError(f"{name} labels not found: {path}")
+    content = path.read_text(encoding="utf-8").strip()
+    if not content:
+        raise ValueError(f"{name} labels file is EMPTY: {path}")
+    data = json.loads(content)
+    if not data:
+        raise ValueError(f"{name} labels file has no entries: {path}")

@@ -46,7 +46,8 @@ class EvidenceBuilder:
                 severity="HIGH"
             ))
 
-        if domain_intel.get("is_suspicious_tld"):
+        suspicious_patterns = set(domain_intel.get("suspicious_patterns", []))
+        if domain_intel.get("is_suspicious_tld") or ("suspicious_tld" in suspicious_patterns):
             evidences.append(ScamEvidence(
                 source="domain",
                 keyword="suspicious_tld",
@@ -139,7 +140,7 @@ class EvidenceBuilder:
         # 8. BRAND IMPERSONATION
         # =========================
         if brand_result.get("is_impersonating"):
-            brand = brand_result.get("brand", "một thương hiệu")
+            brand = brand_result.get("impersonated_brand") or brand_result.get("brand") or "một thương hiệu"
             evidences.append(ScamEvidence(
                 source="brand",
                 keyword="brand_impersonation",

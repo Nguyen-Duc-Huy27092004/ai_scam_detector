@@ -11,11 +11,16 @@ gracefully to OCR+keyword heuristics only.
 """
 
 import json
+import threading
 from typing import Dict, Any, Optional
 from pathlib import Path
 
 from utils.logger import logger
-from utils.config import IMAGE_MODEL_PATH, IMAGE_LABELS_PATH
+from utils.config import (
+    IMAGE_MODEL_PATH,
+    IMAGE_LABELS_PATH,
+    IMAGE_SCAM_CONFIDENCE_THRESHOLD,
+)
 
 # ---------------------------------------------------------------------------
 # OCR helper — centralised in ocr/ocr_engine.py (returns (str, metadata))
@@ -28,6 +33,22 @@ try:
 except Exception:
     def _ocr_text(image_path: str) -> str:  # type: ignore[misc]
         return ""
+
+
+def _read_labels_dict(path: Path) -> Optional[Dict[str, str]]:
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+        if not content:
+            logger.error("image_labels_empty | path=%s", path)
+            return None
+        data = json.loads(content)
+        if not data:
+            logger.error("image_labels_invalid | path=%s", path)
+            return None
+        return data
+    except json.JSONDecodeError as e:
+        logger.error("image_labels_json_error | path=%s | %s", path, str(e))
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +78,7 @@ class _TorchPredictor:
     _labels: Optional[Dict[str, str]] = None
     _loaded: bool = False
     _load_failed: bool = False
+    _load_lock = threading.Lock()
 
     @classmethod
     def _try_load(cls) -> bool:
@@ -64,44 +86,52 @@ class _TorchPredictor:
             return True
         if cls._load_failed:
             return False
-        try:
-            import torch
-            from torchvision import models, transforms  # noqa: F401
+        with cls._load_lock:
+            if cls._loaded:
+                return True
+            if cls._load_failed:
+                return False
+            try:
+                import torch
+                from torchvision import models, transforms  # noqa: F401
 
-            model_path = Path(IMAGE_MODEL_PATH)
-            if not model_path.exists():
-                logger.warning("torch_image_model_not_found | path=%s", model_path)
+                model_path = Path(IMAGE_MODEL_PATH)
+                if not model_path.exists():
+                    logger.warning("torch_image_model_not_found | path=%s", model_path)
+                    cls._load_failed = True
+                    return False
+
+                if not IMAGE_LABELS_PATH.exists():
+                    logger.warning("image_labels_not_found | path=%s", IMAGE_LABELS_PATH)
+                    cls._load_failed = True
+                    return False
+
+                labels = _read_labels_dict(Path(IMAGE_LABELS_PATH))
+                if labels is None:
+                    cls._load_failed = True
+                    return False
+                cls._labels = labels
+
+                num_classes = len(cls._labels)
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+                model = models.resnet18(weights=None)
+                model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
+                model.load_state_dict(
+                    torch.load(str(model_path), map_location=device, weights_only=True)
+                )
+                model.to(device)
+                model.eval()
+
+                cls._model = model
+                cls._loaded = True
+                logger.info("torch_image_model_loaded | path=%s", model_path)
+                return True
+
+            except Exception as e:
+                logger.error("torch_image_model_load_failed | %s", str(e))
                 cls._load_failed = True
                 return False
-
-            if not IMAGE_LABELS_PATH.exists():
-                logger.warning("image_labels_not_found | path=%s", IMAGE_LABELS_PATH)
-                cls._load_failed = True
-                return False
-
-            with open(IMAGE_LABELS_PATH, "r", encoding="utf-8") as f:
-                cls._labels = json.load(f)
-
-            num_classes = len(cls._labels)
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-            model = models.resnet18(weights=None)
-            model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
-            model.load_state_dict(
-                torch.load(str(model_path), map_location=device, weights_only=True)
-            )
-            model.to(device)
-            model.eval()
-
-            cls._model = model
-            cls._loaded = True
-            logger.info("torch_image_model_loaded | path=%s", model_path)
-            return True
-
-        except Exception as e:
-            logger.error("torch_image_model_load_failed | %s", str(e))
-            cls._load_failed = True
-            return False
 
     @classmethod
     def predict(cls, image_path: str) -> Optional[Dict[str, Any]]:
@@ -150,6 +180,7 @@ class _KerasPredictor:
     _labels: Optional[Dict[str, str]] = None
     _loaded: bool = False
     _load_failed: bool = False
+    _load_lock = threading.Lock()
 
     @classmethod
     def _try_load(cls) -> bool:
@@ -157,37 +188,51 @@ class _KerasPredictor:
             return True
         if cls._load_failed:
             return False
-        try:
-            from tensorflow import keras  # type: ignore[import]
+        with cls._load_lock:
+            if cls._loaded:
+                return True
+            if cls._load_failed:
+                return False
+            try:
+                from tensorflow import keras  # type: ignore[import]
 
-            if not IMAGE_LABELS_PATH.exists():
-                logger.warning("keras_labels_not_found | path=%s", IMAGE_LABELS_PATH)
+                if not IMAGE_LABELS_PATH.exists():
+                    logger.warning("keras_labels_not_found | path=%s", IMAGE_LABELS_PATH)
+                    cls._load_failed = True
+                    return False
+
+                labels = _read_labels_dict(Path(IMAGE_LABELS_PATH))
+                if labels is None:
+                    cls._load_failed = True
+                    return False
+                cls._labels = labels
+
+                # Try .h5 alongside the configured .pth path
+                h5_path = Path(IMAGE_MODEL_PATH).with_suffix(".h5")
+                if not h5_path.exists():
+                    logger.warning("keras_model_not_found | path=%s", h5_path)
+                    cls._load_failed = True
+                    return False
+
+                try:
+                    cls._model = keras.models.load_model(
+                        str(h5_path), compile=False, safe_mode=True
+                    )
+                except TypeError:
+                    cls._model = keras.models.load_model(str(h5_path), compile=False)
+
+                cls._loaded = True
+                logger.info("keras_image_model_loaded | path=%s", h5_path)
+                return True
+
+            except ImportError:
+                logger.debug("tensorflow_not_installed — keras predictor unavailable")
                 cls._load_failed = True
                 return False
-
-            with open(IMAGE_LABELS_PATH, "r", encoding="utf-8") as f:
-                cls._labels = json.load(f)
-
-            # Try .h5 alongside the configured .pth path
-            h5_path = Path(IMAGE_MODEL_PATH).with_suffix(".h5")
-            if not h5_path.exists():
-                logger.warning("keras_model_not_found | path=%s", h5_path)
+            except Exception as e:
+                logger.error("keras_image_model_load_failed | %s", str(e))
                 cls._load_failed = True
                 return False
-
-            cls._model = keras.models.load_model(str(h5_path))
-            cls._loaded = True
-            logger.info("keras_image_model_loaded | path=%s", h5_path)
-            return True
-
-        except ImportError:
-            logger.debug("tensorflow_not_installed — keras predictor unavailable")
-            cls._load_failed = True
-            return False
-        except Exception as e:
-            logger.error("keras_image_model_load_failed | %s", str(e))
-            cls._load_failed = True
-            return False
 
     @classmethod
     def predict(cls, image_path: str) -> Optional[Dict[str, Any]]:
@@ -228,8 +273,10 @@ class ImageScamPredictor:
     """
 
     @staticmethod
-    def predict(image_path: str) -> Dict[str, Any]:
-        ocr_text = _ocr_text(image_path)
+    def predict(image_path: str, ocr_text: Optional[str] = None) -> Dict[str, Any]:
+        if ocr_text is None:
+            ocr_text = _ocr_text(image_path)
+        ocr_lower = (ocr_text or "").lower()
 
         # --- Try ML backends ---
         ml_result: Optional[Dict[str, Any]] = None
@@ -258,8 +305,11 @@ class ImageScamPredictor:
         evidence = []
         keyword_boost = 0.0
 
+        high_t = float(IMAGE_SCAM_CONFIDENCE_THRESHOLD)
+        med_t = high_t * 0.57
+
         for keyword, description in SCAM_KEYWORDS.items():
-            if keyword in ocr_text:
+            if keyword in ocr_lower:
                 keyword_boost += 0.08
                 evidence.append({
                     "source": "ocr",
@@ -271,10 +321,10 @@ class ImageScamPredictor:
 
         scam_score = min(confidence + keyword_boost, 1.0)
 
-        if scam_score >= 0.7:
+        if scam_score >= high_t:
             risk_level = "high"
             is_scam = True
-        elif scam_score >= 0.4:
+        elif scam_score >= med_t:
             risk_level = "medium"
             is_scam = False
         else:
@@ -293,7 +343,7 @@ class ImageScamPredictor:
             "is_scam": is_scam,
             "risk_level": risk_level,
             "evidence": evidence,
-            "ocr_text_preview": ocr_text[:300],
+            "ocr_text_preview": ocr_lower[:300],
             "backend": backend,
         }
 
@@ -302,6 +352,6 @@ class ImageScamPredictor:
 # Convenience function
 # ---------------------------------------------------------------------------
 
-def predict_image(image_path: str) -> Dict[str, Any]:
-    """Analyse a single image for scam signals."""
-    return ImageScamPredictor.predict(image_path)
+def predict_image(image_path: str, ocr_text: Optional[str] = None) -> Dict[str, Any]:
+    """Analyse a single image for scam signals. Pass ocr_text to avoid duplicate OCR."""
+    return ImageScamPredictor.predict(image_path, ocr_text=ocr_text)

@@ -7,12 +7,15 @@ Production fixes:
 - Sanitized logs (no PII/response body)
 - Timeout on all HTTP calls
 - Input length validation
+- SSE streaming without blocking the event loop
 """
-import json
 import asyncio
-from typing import List, Dict, Any, Optional
+import json
+from collections.abc import AsyncGenerator
+from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, validator
+import requests
+from pydantic import BaseModel, Field, field_validator
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -26,78 +29,68 @@ from utils.validators import is_valid_url
 from utils.url_utils import is_safe_url
 from services.url_pipeline import analyze_url
 from services.text_pipeline import analyze_text
-import requests
 
 router = APIRouter()
 
-# ========================
-# MAX LIMITS
-# ========================
 MAX_MESSAGE_LENGTH = 4000
-MAX_MESSAGES       = 30
+MAX_MESSAGES = 30
 
-
-# ========================
-# REQUEST SCHEMAS
-# ========================
 
 class ChatMessage(BaseModel):
-    role:    str = Field(..., description="user or assistant")
+    role: str = Field(..., description="user or assistant")
     content: str = Field(..., description="Message content")
 
-    @validator("content")
-    def content_not_empty(cls, v):
+    @field_validator("content")
+    @classmethod
+    def content_not_empty(cls, v: str) -> str:
         v = v.strip()
         if not v:
             raise ValueError("Message content cannot be empty")
-        return v[:MAX_MESSAGE_LENGTH]  # Truncate silently
+        return v[:MAX_MESSAGE_LENGTH]
 
-    @validator("role")
-    def role_valid(cls, v):
+    @field_validator("role")
+    @classmethod
+    def role_valid(cls, v: str) -> str:
         if v not in ("user", "assistant", "system", "tool"):
             raise ValueError("Invalid role")
         return v
 
 
 class ChatRequest(BaseModel):
-    messages: List[ChatMessage] = Field(..., max_items=MAX_MESSAGES)
-    images:   Optional[List[str]] = Field(None, description="Base64 encoded images (optional)")
-    stream:   bool = Field(False, description="Stream response via SSE")
+    messages: List[ChatMessage] = Field(..., max_length=MAX_MESSAGES)
+    images: Optional[List[str]] = Field(None, description="Base64 encoded images (optional)")
+    stream: bool = Field(False, description="Stream response via SSE")
 
-
-# ========================
-# TOOL DEFINITIONS
-# ========================
 
 TOOLS = [
     {
         "type": "function",
         "function": {
-            "name":        "analyze_url",
+            "name": "analyze_url",
             "description": "Analyzes a URL for phishing and scam indicators. Returns a detailed risk report.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "The full URL to analyze (must start with http/https)"}
                 },
-                "required": ["url"]
-            }
-        }
+                "required": ["url"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
-            "name":        "analyze_text",
+            "name": "analyze_text",
             "description": "Analyzes a text message or email for scam patterns.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "text": {"type": "string", "description": "Text content to analyze"}
                 },
-                "required": ["text"]
-            }
-        }
-    }
+                "required": ["text"],
+            },
+        },
+    },
 ]
 
 SYSTEM_PROMPT = (
@@ -109,14 +102,9 @@ SYSTEM_PROMPT = (
 )
 
 
-# ========================
-# LLM CALL (sync, runs in thread)
-# ========================
-
 def _call_llm_with_tools(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Call LLM API with tool support. Returns assistant message dict."""
 
-    # ─── Ollama (no native tool calling) ───────────────────────────────────
     if LLM_PROVIDER not in ("openai", "gemini"):
         try:
             resp = requests.post(
@@ -131,15 +119,14 @@ def _call_llm_with_tools(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
             logger.warning("ollama_chat_fail | %s", str(e))
         return {"role": "assistant", "content": "Dịch vụ AI tạm thời không khả dụng. Vui lòng thử lại sau."}
 
-    # ─── OpenAI / Gemini ────────────────────────────────────────────────────
     headers = {
         "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type":  "application/json",
+        "Content-Type": "application/json",
     }
     payload = {
-        "model":       LLM_MODEL,
-        "messages":    messages,
-        "tools":       TOOLS,
+        "model": LLM_MODEL,
+        "messages": messages,
+        "tools": TOOLS,
         "tool_choice": "auto",
     }
     try:
@@ -151,7 +138,6 @@ def _call_llm_with_tools(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         )
         if resp.status_code == 200:
             return resp.json()["choices"][0]["message"]
-        # FIX: log status only — NOT resp.text which may contain user PII
         logger.error("llm_chat_http_error | provider=%s | status=%d", LLM_PROVIDER, resp.status_code)
     except requests.exceptions.Timeout:
         logger.warning("llm_chat_timeout | provider=%s", LLM_PROVIDER)
@@ -161,14 +147,9 @@ def _call_llm_with_tools(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"role": "assistant", "content": "Dịch vụ AI tạm thời không khả dụng. Vui lòng thử lại sau."}
 
 
-# ========================
-# SSE STREAMING (sync generator)
-# ========================
-
 def _stream_llm(messages: List[Dict[str, Any]]):
-    """Generator for streaming LLM responses via SSE."""
+    """Synchronous generator for streaming LLM responses (runs in a worker thread)."""
     if LLM_PROVIDER not in ("openai", "gemini"):
-        # Ollama streaming via /api/chat
         try:
             resp = requests.post(
                 f"{LLM_BASE_URL}/api/chat",
@@ -194,10 +175,9 @@ def _stream_llm(messages: List[Dict[str, Any]]):
         yield {"event": "done", "data": "[DONE]"}
         return
 
-    # OpenAI streaming
     headers = {
         "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type":  "application/json",
+        "Content-Type": "application/json",
     }
     payload = {"model": LLM_MODEL, "messages": messages, "stream": True}
     try:
@@ -223,9 +203,7 @@ def _stream_llm(messages: List[Dict[str, Any]]):
                 try:
                     chunk = json.loads(data_str)
                     delta_content = (
-                        chunk.get("choices", [{}])[0]
-                             .get("delta", {})
-                             .get("content", "")
+                        chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
                     )
                     if delta_content:
                         yield {"event": "message", "data": json.dumps({"content": delta_content})}
@@ -238,9 +216,26 @@ def _stream_llm(messages: List[Dict[str, Any]]):
         yield {"event": "error", "data": json.dumps({"error": "Stream interrupted"})}
 
 
-# ========================
-# TOOL EXECUTION (async)
-# ========================
+async def _async_stream_llm(messages: List[Dict[str, Any]]) -> AsyncGenerator[dict, None]:
+    """Bridge sync SSE generator to async iteration without blocking the event loop."""
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _producer() -> None:
+        try:
+            for item in _stream_llm(messages):
+                loop.call_soon_threadsafe(queue.put_nowait, item)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    await loop.run_in_executor(None, _producer)
+
+    while True:
+        item = await queue.get()
+        if item is None:
+            break
+        yield item
+
 
 async def _execute_tool(function_name: str, function_args: dict) -> str:
     """Execute a tool call from the LLM. Returns JSON string result."""
@@ -248,7 +243,6 @@ async def _execute_tool(function_name: str, function_args: dict) -> str:
     if function_name == "analyze_url":
         url = str(function_args.get("url", "")).strip()
 
-        # FIX: SSRF guard — LLM can be prompt-injected to supply internal URLs
         if not is_valid_url(url) or not is_safe_url(url):
             logger.warning("chat_tool_ssrf_blocked | url=%.100s", url)
             return json.dumps({"error": "URL không hợp lệ hoặc bị chặn vì lý do bảo mật"})
@@ -257,15 +251,15 @@ async def _execute_tool(function_name: str, function_args: dict) -> str:
             res = await asyncio.to_thread(analyze_url, url)
             return json.dumps({
                 "risk_level": res.get("risk_level"),
-                "score":      res.get("overall_score"),
-                "is_scam":    res.get("is_scam"),
-                "signals":    res.get("risk_factors", [])[:5],
+                "score": res.get("overall_score"),
+                "is_scam": res.get("is_scam"),
+                "signals": res.get("risk_factors", [])[:5],
             })
         except Exception as e:
             logger.warning("tool_analyze_url_fail | %s", str(e))
-            return json.dumps({"error": f"URLs analysis failed: {str(e)}"})
+            return json.dumps({"error": "URL analysis failed. Please try again."})
 
-    elif function_name == "analyze_text":
+    if function_name == "analyze_text":
         text = str(function_args.get("text", "")).strip()
         if not text:
             return json.dumps({"error": "Text input is empty"})
@@ -275,19 +269,15 @@ async def _execute_tool(function_name: str, function_args: dict) -> str:
             res = await asyncio.to_thread(analyze_text, text)
             return json.dumps({
                 "risk_level": res.get("risk_level"),
-                "score":      res.get("overall_score"),
-                "keywords":   res.get("keywords", [])[:8],
+                "score": res.get("overall_score"),
+                "keywords": res.get("keywords", [])[:8],
             })
         except Exception as e:
             logger.warning("tool_analyze_text_fail | %s", str(e))
-            return json.dumps({"error": f"Text analysis failed: {str(e)}"})
+            return json.dumps({"error": "Text analysis failed. Please try again."})
 
-    return json.dumps({"error": f"Unknown tool: {function_name}"})
+    return json.dumps({"error": "Unknown tool"})
 
-
-# ========================
-# MAIN ENDPOINT
-# ========================
 
 @router.post("/completions")
 @limiter.limit("15/minute")
@@ -302,32 +292,27 @@ async def chat_completions(request: Request, payload: ChatRequest):
             for msg in payload.messages
         ]
 
-        # Inject system prompt if not present
         if not messages or messages[0].get("role") != "system":
             messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
-        # ─── First LLM call ───────────────────────────────────────────────
         response_message = await asyncio.to_thread(_call_llm_with_tools, messages)
 
         tool_calls = response_message.get("tool_calls")
 
         if not tool_calls:
-            # No tool use — return or stream directly
             if payload.stream:
-                return EventSourceResponse(_stream_llm(messages))
+                return EventSourceResponse(_async_stream_llm(messages))
             return JSONResponse(content={"success": True, "message": response_message})
 
-        # ─── Execute tool calls ───────────────────────────────────────────
         messages.append(response_message)
 
         for tool_call in tool_calls:
-            tc_id          = tool_call.get("id", "")
-            function_info  = tool_call.get("function", {})
-            function_name  = function_info.get("name", "")
+            tc_id = tool_call.get("id", "")
+            function_info = tool_call.get("function", {})
+            function_name = function_info.get("name", "")
 
-            # FIX: JSON parse error handling — LLM can return malformed args
             try:
-                raw_args      = function_info.get("arguments", "{}")
+                raw_args = function_info.get("arguments", "{}")
                 function_args = json.loads(raw_args) if raw_args else {}
             except (json.JSONDecodeError, TypeError) as e:
                 logger.warning("tool_call_args_parse_fail | tool=%s | %s", function_name, str(e))
@@ -339,14 +324,13 @@ async def chat_completions(request: Request, payload: ChatRequest):
 
             messages.append({
                 "tool_call_id": tc_id,
-                "role":         "tool",
-                "name":         function_name,
-                "content":      tool_result,
+                "role": "tool",
+                "name": function_name,
+                "content": tool_result,
             })
 
-        # ─── Second LLM call with tool results ───────────────────────────
         if payload.stream:
-            return EventSourceResponse(_stream_llm(messages))
+            return EventSourceResponse(_async_stream_llm(messages))
 
         final_response = await asyncio.to_thread(_call_llm_with_tools, messages)
         return JSONResponse(content={"success": True, "message": final_response})
@@ -355,5 +339,5 @@ async def chat_completions(request: Request, payload: ChatRequest):
         logger.error("chat_endpoint_error | %s", str(e))
         return JSONResponse(
             status_code=500,
-            content={"success": False, "error": "Internal server error"}
+            content={"success": False, "error": "Internal server error"},
         )

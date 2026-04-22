@@ -1,38 +1,47 @@
+from pathlib import Path
+
+import joblib
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-import joblib
-import os
 
-df = pd.read_csv("data/phishing.csv")
-print("Tổng số mẫu:", len(df))
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+DATA_PATH = BASE_DIR / "data" / "phishing.csv"
+MODEL_DIR = BASE_DIR / "models"
+SCALER_PATH = MODEL_DIR / "scaler.pkl"
 
-if "id" in df.columns:
-    df = df.drop(columns=["id"])
 
-X = df.drop(columns=["CLASS_LABEL"])
-y = df["CLASS_LABEL"]
+def main() -> None:
+    df = pd.read_csv(DATA_PATH)
+    print("Tổng số mẫu:", len(df))
 
-print("Số feature:", X.shape[1])
+    if "id" in df.columns:
+        df = df.drop(columns=["id"])
 
-if X.shape[1] != 48:
-    raise ValueError(f"Dataset có {X.shape[1]} feature, nhưng model yêu cầu 48")
+    X = df.drop(columns=["CLASS_LABEL"])
+    y = df["CLASS_LABEL"]
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y,
-    test_size=0.2,
-    random_state=42,
-    stratify=y
-)
+    print("Số feature:", X.shape[1])
 
-scaler = StandardScaler()
-X_train_scaled = scaler.fit_transform(X_train)
-X_test_scaled = scaler.transform(X_test)
+    if X.shape[1] != 48:
+        raise ValueError(f"Dataset có {X.shape[1]} feature, nhưng model yêu cầu 48")
 
-os.makedirs("models", exist_ok=True)
-joblib.dump(scaler, "models/scaler.pkl")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
 
-print("Preprocess hoàn tất")
-print("Train samples:", X_train_scaled.shape[0])
-print("Test samples:", X_test_scaled.shape[0])
-print("Scaler saved to models/scaler.pkl")
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(scaler, SCALER_PATH)
+
+    print("Preprocess hoàn tất")
+    print("Train samples:", X_train_scaled.shape[0])
+    print("Test samples:", X_test_scaled.shape[0])
+    print("Scaler saved to", SCALER_PATH)
+
+
+if __name__ == "__main__":
+    main()

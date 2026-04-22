@@ -14,6 +14,7 @@ import os
 import sqlite3
 import hashlib
 import time
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Optional
@@ -41,6 +42,7 @@ class DatasetChecker:
     def __init__(self):
         self._openphish_feed: Optional[set] = None
         self._openphish_loaded_at: float = 0.0
+        self._refresh_lock = threading.Lock()
         self._ensure_blacklist_db()
 
     # =============================
@@ -104,14 +106,22 @@ class DatasetChecker:
                     "app_key": PHISHTANK_API_KEY,
                 },
                 timeout=5,
+                verify=True,
                 headers={"User-Agent": "phishtank/ai-scam-detector"}
             )
+            resp.raise_for_status()
             data = resp.json()
             results = data.get("results", {})
             return {
                 "is_phishing": results.get("in_database", False) and results.get("valid", False),
                 "detail": results.get("phish_detail_page", "")
             }
+        except requests.HTTPError as e:
+            logger.warning("phishtank_http_error | status=%s", getattr(e.response, "status_code", "unknown"))
+            return {"is_phishing": False}
+        except (ValueError, KeyError) as e:
+            logger.warning("phishtank_parse_error | error=%s", str(e))
+            return {"is_phishing": False}
         except Exception as e:
             logger.warning("phishtank_check_failed | error=%s", str(e))
             return {"is_phishing": False}
@@ -134,9 +144,15 @@ class DatasetChecker:
         if url in self._openphish_feed:
             return True
 
-        # Domain prefix match
+        # Domain suffix match
         domain = urlparse(url).netloc.lower()
-        return any(domain in entry for entry in self._openphish_feed)
+        if not domain:
+            return False
+        return any(
+            entry_domain == domain or entry_domain.endswith("." + domain) or domain.endswith("." + entry_domain)
+            for entry_domain in (urlparse(entry).netloc.lower() for entry in self._openphish_feed)
+            if entry_domain
+        )
 
     def _maybe_refresh_openphish(self) -> None:
         """Download fresh OpenPhish feed if needed."""
@@ -144,9 +160,12 @@ class DatasetChecker:
         now = time.time()
 
         # Load from disk if in-memory cache is stale or empty
-        if (self._openphish_feed is None or
-                now - self._openphish_loaded_at > _OPENPHISH_REFRESH_INTERVAL):
-
+        if self._openphish_feed is not None and now - self._openphish_loaded_at <= _OPENPHISH_REFRESH_INTERVAL:
+            return
+        with self._refresh_lock:
+            now = time.time()
+            if self._openphish_feed is not None and now - self._openphish_loaded_at <= _OPENPHISH_REFRESH_INTERVAL:
+                return
             if feed_path.exists() and (now - feed_path.stat().st_mtime < _OPENPHISH_REFRESH_INTERVAL):
                 # Feed file is fresh — load from disk
                 try:
@@ -227,7 +246,9 @@ class DatasetChecker:
     def add_to_blacklist(self, domain: str, reason: str = "") -> bool:
         """Add a domain to the internal blacklist (admin use)."""
         try:
-            domain = domain.lower().lstrip("www.")
+            domain = domain.lower().strip()
+            if domain.startswith("www."):
+                domain = domain[4:]
             with sqlite3.connect(str(BLACKLIST_DB_PATH)) as conn:
                 conn.execute(
                     "INSERT OR IGNORE INTO blacklist (domain, reason) VALUES (?, ?)",
@@ -243,13 +264,17 @@ class DatasetChecker:
 
 # Module-level singleton
 _checker_instance: Optional[DatasetChecker] = None
+_checker_lock = threading.Lock()
 
 
 def get_dataset_checker() -> DatasetChecker:
     """Get or create the singleton DatasetChecker instance."""
     global _checker_instance
-    if _checker_instance is None:
-        _checker_instance = DatasetChecker()
+    if _checker_instance is not None:
+        return _checker_instance
+    with _checker_lock:
+        if _checker_instance is None:
+            _checker_instance = DatasetChecker()
     return _checker_instance
 
 
