@@ -122,7 +122,7 @@ BLACKLIST_DB_PATH = DATA_DIR / "blacklist.db"
 # LLM Configuration
 # ========================
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama")
-LLM_MODEL = os.getenv("LLM_MODEL", "llama")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemma:2b")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 
