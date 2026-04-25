@@ -2,6 +2,13 @@
 URL utility functions.
 
 Provides URL normalization, SSRF protection, and domain extraction.
+
+SSRF Hardening Notes:
+  - DNS resolution is done at validation time. A small rebinding window exists
+    between validation and the actual HTTP connection. Mitigation: use short
+    connect timeouts and avoid caching resolved IPs for reuse.
+  - Octal/hex/decimal IP representations are normalized before validation.
+  - IPv6-mapped IPv4 addresses (::ffff:10.x.x.x) are unwrapped and checked.
 """
 
 import ipaddress
@@ -19,29 +26,56 @@ from utils.logger import logger
 # =============================================
 
 _BLOCKED_NETWORKS = [
-    ipaddress.ip_network("10.0.0.0/8"),         # Private Class A
-    ipaddress.ip_network("172.16.0.0/12"),       # Private Class B
-    ipaddress.ip_network("192.168.0.0/16"),      # Private Class C
-    ipaddress.ip_network("127.0.0.0/8"),         # Loopback
-    ipaddress.ip_network("169.254.0.0/16"),      # Link-local (AWS metadata)
-    ipaddress.ip_network("100.64.0.0/10"),       # Carrier-grade NAT
-    ipaddress.ip_network("::1/128"),             # IPv6 loopback
-    ipaddress.ip_network("fc00::/7"),            # IPv6 private
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),   # Link-local / AWS metadata
+    ipaddress.ip_network("100.64.0.0/10"),    # Carrier-grade NAT
+    ipaddress.ip_network("0.0.0.0/8"),        # "This" network
+    ipaddress.ip_network("192.0.0.0/24"),     # IETF Protocol Assignments
+    ipaddress.ip_network("198.51.100.0/24"),  # TEST-NET-2
+    ipaddress.ip_network("203.0.113.0/24"),   # TEST-NET-3
+    ipaddress.ip_network("240.0.0.0/4"),      # Reserved
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("::ffff:0:0/96"),    # IPv6-mapped IPv4 (catch-all)
 ]
+
+
+def _is_blocked_ip(ip_str: str) -> bool:
+    """
+    Check if a resolved IP string is in a blocked network.
+    Handles:
+      - Standard IPv4 / IPv6
+      - IPv6-mapped IPv4 (::ffff:10.0.0.1) — unwrapped and re-checked
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+
+        # Unwrap IPv6-mapped IPv4
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+
+        for network in _BLOCKED_NETWORKS:
+            try:
+                if ip in network:
+                    return True
+            except TypeError:
+                continue  # mixed v4/v6 — skip
+        return False
+    except ValueError:
+        return True  # unparseable → block
 
 
 def is_safe_url(url: str) -> bool:
     """
     SSRF protection: reject URLs that resolve to private/internal IP addresses.
 
-    This must be called BEFORE any outbound HTTP request to prevent
-    Server-Side Request Forgery (SSRF) attacks.
-
-    Args:
-        url: URL to validate
-
-    Returns:
-        bool: True if URL is safe (public IP), False if it resolves to private range
+    This must be called BEFORE any outbound HTTP request.
+    Note: a short DNS rebinding window remains between this call and the actual
+    HTTP connection. Use short connect timeouts to minimize exposure.
     """
     try:
         parsed = urlparse(url)
@@ -50,47 +84,55 @@ def is_safe_url(url: str) -> bool:
         if not hostname:
             return False
 
-        # Reject hostnames that look like internal addresses directly
-        if hostname.lower() in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
-            logger.warning("ssrf_blocked | hostname=%s | reason=localhost_or_zero", hostname)
+        # Reject scheme-level tricks
+        if parsed.scheme not in ("http", "https"):
+            logger.warning("ssrf_blocked | hostname=%s | reason=disallowed_scheme | scheme=%s", hostname, parsed.scheme)
             return False
-            
-        # Reject explicitly internal/local domains
+
+        # Reject obvious local hostnames
+        if hostname.lower() in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+            logger.warning("ssrf_blocked | hostname=%s | reason=localhost_literal", hostname)
+            return False
+
+        # Reject internal TLDs
         if hostname.endswith((".local", ".internal", ".host", ".lan", ".home", ".test", ".invalid", ".example")):
             logger.warning("ssrf_blocked | hostname=%s | reason=internal_tld", hostname)
             return False
-            
-        # Reject AWS/GCP metadata domain spoofing
-        if "169.254" in hostname or "metadata.google.internal" in hostname or "instance-data" in hostname:
-            logger.warning("ssrf_blocked | hostname=%s | reason=metadata_spoofing", hostname)
+
+        # Reject cloud metadata hostnames (string-level guard)
+        _METADATA_HOSTS = (
+            "metadata.google.internal", "instance-data",
+            "169.254.169.254",  # AWS/Azure/GCP metadata
+        )
+        if any(m in hostname for m in _METADATA_HOSTS):
+            logger.warning("ssrf_blocked | hostname=%s | reason=metadata_host", hostname)
             return False
 
-        # Resolve hostname to IP
+        # Resolve hostname — treat DNS failure as unsafe
         try:
-            ip_str = socket.gethostbyname(hostname)
-            ip = ipaddress.ip_address(ip_str)
-        except (socket.gaierror, ValueError):
-            # Cannot resolve — treat as unsafe to avoid DNS tricks
+            # getaddrinfo returns all records (handles IPv6 as well)
+            records = socket.getaddrinfo(hostname, None)
+            if not records:
+                logger.warning("ssrf_blocked | hostname=%s | reason=no_dns_records", hostname)
+                return False
+        except (socket.gaierror, OSError):
             logger.warning("ssrf_blocked | hostname=%s | reason=dns_resolution_failed", hostname)
             return False
 
-        # Check against blocked ranges
-        for network in _BLOCKED_NETWORKS:
-            try:
-                if ip in network:
-                    logger.warning(
-                        "ssrf_blocked | hostname=%s | ip=%s | network=%s",
-                        hostname, ip_str, network
-                    )
-                    return False
-            except TypeError:
-                # IPv6 ip in IPv4 network (or vice versa) → skip
-                continue
+        # Check every resolved IP — block if ANY resolves to a private range
+        for record in records:
+            ip_str = record[4][0]
+            if _is_blocked_ip(ip_str):
+                logger.warning(
+                    "ssrf_blocked | hostname=%s | ip=%s | reason=private_ip",
+                    hostname, ip_str,
+                )
+                return False
 
         return True
 
     except Exception as e:
-        logger.warning("ssrf_check_error | url=%s | error=%s", url[:100], str(e))
+        logger.warning("ssrf_check_error | url=%.100s | error=%s", url, str(e))
         return False
 
 

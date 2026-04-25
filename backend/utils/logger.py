@@ -16,8 +16,19 @@ import sys
 from pathlib import Path
 from datetime import datetime
 import uuid
+from contextvars import ContextVar
 
 from utils.config import LOG_FILE, LOG_LEVEL, LOG_MAX_BYTES, LOG_BACKUP_COUNT
+
+# ContextVar for request-scoped tracing.
+# Set by RequestIDMiddleware; readable anywhere in the same async task tree.
+# Import here (not from core.middleware) to avoid circular imports.
+_request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
+
+
+def get_request_id_ctx() -> ContextVar[str]:
+    """Return the shared ContextVar instance for external callers to set."""
+    return _request_id_ctx
 
 
 # ==========================
@@ -41,7 +52,12 @@ class JsonFormatter(logging.Formatter):
             "module": record.name,
         }
 
-        # optional fields
+        # Always include request_id from ContextVar (empty outside a request context)
+        req_id = _request_id_ctx.get("-")
+        if req_id and req_id != "-":
+            log_record["request_id"] = req_id
+
+        # optional trace_id from explicit log_with_trace() calls
         if hasattr(record, "trace_id"):
             log_record["trace_id"] = record.trace_id
 

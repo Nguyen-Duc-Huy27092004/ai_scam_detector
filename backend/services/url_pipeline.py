@@ -1,14 +1,21 @@
 """
 URL Analysis Pipeline — Optimized (No LLM Timeout, Feature-Based)
+Production hardened:
+  - All blocking calls wrapped in asyncio.to_thread / run_in_executor
+  - body_text sanitized before LLM (prompt injection defense)
+  - IS_SCAM_THRESHOLD loaded from config (env-configurable)
+  - atexit replaced by SIGTERM handler in main.py
+  - hrefs regex applied to capped HTML to prevent memory spike
 """
 
-import atexit
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Any, List
+from typing import Dict, Any
 from urllib.parse import urlparse
 import time
 
 from utils.logger import logger
+from utils.config import IS_SCAM_THRESHOLD
+from utils.content_sanitizer import sanitize_for_llm, wrap_for_llm
 
 from services.async_crawler import SecureCrawler
 from services.domain_intel import get_domain_intel
@@ -21,9 +28,12 @@ from services.brand_detector import detect_brand_impersonation
 from services.content_extractor import ContentExtractor
 from services.file_analyzer import FileAnalyzer
 from services.screenshot import ScreenshotService
+from services.domain_info import get_domain_info
 
 from ml.url.predict import predict_url
 from llm.llm_explainer import generate_explanation
+from services.llm_fusion import fuse_llm_with_risk
+from ocr.ocr_engine import OCREngine as _OCREngine
 
 
 _dataset_checker = DatasetChecker()
@@ -31,20 +41,8 @@ _dataset_checker = DatasetChecker()
 # I/O vs LLM: separate pools so slow LLM jobs cannot starve crawl/intel/network/brand.
 _IO_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="url-io")
 _LLM_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="url-llm")
-atexit.register(lambda: _IO_EXECUTOR.shutdown(wait=False))
-atexit.register(lambda: _LLM_EXECUTOR.shutdown(wait=False))
-
-IS_SCAM_THRESHOLD = 60.0
-
-
-def _safe_future(name: str, future, timeout=8):
-    start = time.time()
-    try:
-        result = future.result(timeout=timeout)
-        return result if result is not None else {}
-    except Exception as e:
-        logger.warning("future_fail | %s | %s", name, str(e))
-        return {}
+# Shutdown is handled by SIGTERM handler in main.py (reliable under Docker/K8s).
+# atexit is intentionally NOT used here.
 
 
 def _fallback_explanation(score, risk_level, risk_factors, confidence):
@@ -62,14 +60,17 @@ def _fallback_explanation(score, risk_level, risk_factors, confidence):
 class URLAnalysisPipeline:
 
     @staticmethod
-    def analyze(url: str) -> Dict[str, Any]:
+    async def analyze(url: str) -> Dict[str, Any]:
+        """Full async URL analysis pipeline."""
+        import asyncio
         start_total = time.time()
 
         try:
             # ========================
             # 1. REDIRECT
+            # ✔ Wrapped in to_thread — requests lib is blocking
             # ========================
-            redirect_info = analyze_redirects(url) or {}
+            redirect_info = await asyncio.to_thread(analyze_redirects, url) or {}
             final_url = redirect_info.get("final_url") or url
 
             if not SecureCrawler.is_safe_url(final_url):
@@ -79,37 +80,100 @@ class URLAnalysisPipeline:
 
             # ========================
             # 2. BLACKLIST
+            # ✔ Wrapped in to_thread — SQLite I/O is blocking
             # ========================
-            blacklist = _dataset_checker.check_url(final_url) or {}
+            blacklist = await asyncio.to_thread(_dataset_checker.check_url, final_url) or {}
 
             # ========================
-            # 3. PARALLEL TASKS
+            # 3. PARALLEL TASKS (run in IO thread pool via run_in_executor)
             # ========================
-            futures = {
-                "crawl": _IO_EXECUTOR.submit(SecureCrawler.crawl_sync, final_url),
-                "intel": _IO_EXECUTOR.submit(get_domain_intel, final_url),
-                "network": _IO_EXECUTOR.submit(NetworkAnalyzer.analyze, final_url),
-                "brand": _IO_EXECUTOR.submit(detect_brand_impersonation, domain),
-            }
+            loop = asyncio.get_running_loop()
+            f_crawl       = loop.run_in_executor(_IO_EXECUTOR, SecureCrawler.crawl_sync, final_url)
+            f_intel       = loop.run_in_executor(_IO_EXECUTOR, get_domain_intel, final_url)
+            f_network     = loop.run_in_executor(_IO_EXECUTOR, NetworkAnalyzer.analyze, final_url)
+            f_brand       = loop.run_in_executor(_IO_EXECUTOR, detect_brand_impersonation, domain)
+            f_domain_info = loop.run_in_executor(_IO_EXECUTOR, get_domain_info, domain)
+            f_screenshot  = loop.run_in_executor(_IO_EXECUTOR, ScreenshotService.capture, final_url)
 
-            crawl = _safe_future("crawl", futures["crawl"], 10)
-            intel = _safe_future("intel", futures["intel"], 6)
-            network = _safe_future("network", futures["network"], 6)
-            brand = _safe_future("brand", futures["brand"], 5)
+            results = await asyncio.gather(
+                asyncio.wait_for(f_crawl,       timeout=10),
+                asyncio.wait_for(f_intel,       timeout=6),
+                asyncio.wait_for(f_network,     timeout=6),
+                asyncio.wait_for(f_brand,       timeout=5),
+                asyncio.wait_for(f_domain_info, timeout=5),
+                return_exceptions=True,
+            )
+
+            def _safe(r): return r if isinstance(r, dict) else {}
+            crawl, intel, network, brand, domain_info = map(_safe, results)
+
+            try:
+                screenshot = await asyncio.wait_for(f_screenshot, timeout=15)
+            except Exception as e:
+                logger.warning("screenshot_timeout | %s", str(e))
+                screenshot = None
 
             html = crawl.get("html", "")
 
             # ========================
-            # 4. CONTENT METADATA
+            # EXTRACT BODY TEXT
+            # ========================
+            body_text = ""
+            if html:
+                try:
+                    from bs4 import BeautifulSoup as _BS
+                    _soup = _BS(html, "html.parser")
+                    for _tag in _soup(["script", "style", "noscript", "head"]):
+                        _tag.decompose()
+                    body_text = _soup.get_text(" ", strip=True)
+                    body_text = " ".join(body_text.split())[:1200]
+                except Exception as _e:
+                    logger.warning("body_text_extract_failed | %s", str(_e))
+
+            # ========================
+            # OCR FROM SCREENSHOT
+            # ✔ Wrapped in to_thread — Tesseract is CPU-bound/blocking
+            # ========================
+            if screenshot and isinstance(screenshot, str):
+                try:
+                    ocr_text, _ = await asyncio.to_thread(_OCREngine.extract_text, screenshot)
+                    if ocr_text and len(ocr_text.strip()) > 20:
+                        ocr_clean = " ".join(ocr_text.split())[:600]
+                        if len(body_text) < 200:
+                            body_text = ocr_clean
+                            logger.info("ocr_primary | len=%d", len(ocr_clean))
+                        else:
+                            body_text = body_text[:900] + " [OCR] " + ocr_clean
+                            logger.info("ocr_appended | ocr_len=%d", len(ocr_clean))
+                    else:
+                        logger.info("ocr_empty_or_short | skipped")
+                except Exception as _e:
+                    logger.warning("ocr_pipeline_failed | %s", str(_e))
+
+            # ========================
+            # 4. CONTENT METADATA & FILES
             # ========================
             metadata = {}
+            has_dangerous_files = False
+
             if html:
                 metadata = ContentExtractor.extract_metadata(html, base_url=final_url)
 
+                import re
+                # Cap HTML to 50KB before regex to prevent memory spike
+                hrefs = re.findall(r'href=[\'"]([^\'"]+)[\'"]', html[:50_000], re.IGNORECASE)
+                dangerous_exts = FileAnalyzer.DANGEROUS_EXTS.union({"apk", "msi"})
+                for h in hrefs:
+                    ext = h.split('?')[0].split('.')[-1].lower() if '.' in h else ''
+                    if ext in dangerous_exts:
+                        has_dangerous_files = True
+                        break
+
             # ========================
             # 5. ML
+            # ✔ Wrapped in to_thread — CPU-bound model inference
             # ========================
-            ml = predict_url(final_url) or {}
+            ml = await asyncio.to_thread(predict_url, final_url) or {}
             confidence = float(ml.get("confidence", 0.01))
 
             # ========================
@@ -119,20 +183,12 @@ class URLAnalysisPipeline:
             patterns.extend(network.get("risk_flags", []))
             patterns.extend(intel.get("suspicious_patterns", []))
 
-            if metadata.get("has_login_form"):
-                patterns.append("login_form")
-
-            if metadata.get("has_otp_field"):
-                patterns.append("otp_request")
-
-            if metadata.get("urgency_phrases"):
-                patterns.append("urgency_detected")
-
-            if brand.get("is_impersonating"):
-                patterns.append("brand_impersonation")
-
-            if blacklist.get("is_blacklisted"):
-                patterns.append("blacklisted_url")
+            if metadata.get("has_login_form"):   patterns.append("login_form")
+            if metadata.get("has_otp_field"):    patterns.append("otp_request")
+            if metadata.get("urgency_phrases"):  patterns.append("urgency_detected")
+            if brand.get("is_impersonating"):    patterns.append("brand_impersonation")
+            if blacklist.get("is_blacklisted"):  patterns.append("blacklisted_url")
+            if has_dangerous_files:              patterns.append("malicious_file_download")
 
             patterns = list(set(patterns))[:15]
 
@@ -149,34 +205,47 @@ class URLAnalysisPipeline:
                 domain=domain,
                 is_blacklisted=blacklist.get("is_blacklisted", False),
             )
-
             score = float(score or 0.0)
 
             # ========================
-            # 8. LLM (FEATURE ONLY)
+            # 8. LLM
+            # ✔ body_text sanitized before injection (prompt injection defense)
             # ========================
             llm = _fallback_explanation(score, risk_level, patterns, confidence)
 
             try:
+                safe_content = sanitize_for_llm(body_text)
+                wrapped_content = wrap_for_llm(safe_content) if safe_content else ""
+
                 llm_features = {
-                    "has_login_form": metadata.get("has_login_form"),
+                    "has_login_form":    metadata.get("has_login_form"),
                     "has_external_form": metadata.get("has_external_form"),
-                    "password_inputs": metadata.get("password_inputs"),
-                    "external_links": metadata.get("external_links"),
-                    "urgency": metadata.get("urgency_phrases", [])[:3],
-                    "keywords": metadata.get("suspicious_keywords", [])[:3],
+                    "password_inputs":   metadata.get("password_inputs"),
+                    "external_links":    metadata.get("external_links"),
+                    "urgency":           metadata.get("urgency_phrases", [])[:3],
+                    "keywords":          metadata.get("suspicious_keywords", [])[:3],
                 }
 
-                llm_future = _LLM_EXECUTOR.submit(generate_explanation, {
-                    "overall_score": score,
-                    "risk_level": risk_level,
-                    "risk_factors": patterns,
-                    "confidence": confidence,
-                    "domain": domain,
-                    "metadata": llm_features   # ✅ QUAN TRỌNG
+                llm_future = loop.run_in_executor(_LLM_EXECUTOR, generate_explanation, {
+                    "overall_score":   score,
+                    "risk_level":      risk_level,
+                    "risk_factors":    patterns,
+                    "confidence":      confidence,
+                    "domain":          domain,
+                    "metadata":        llm_features,
+                    "title":           metadata.get("title") or "No Title",
+                    "content_summary": wrapped_content or metadata.get("description") or "",
                 })
 
-                llm = _safe_future("llm", llm_future, timeout=15) or llm
+                llm_raw = await asyncio.wait_for(llm_future, timeout=45) or {}
+
+                llm = fuse_llm_with_risk(
+                    risk_level=risk_level,
+                    score=score,
+                    confidence=confidence,
+                    signals=patterns,
+                    llm_raw=llm_raw,
+                )
 
             except Exception as e:
                 logger.warning("llm_fail | %s", str(e))
@@ -188,26 +257,29 @@ class URLAnalysisPipeline:
                 analysis_type="url",
                 risk_level=risk_level,
                 risk_factors=patterns,
-                confidence=confidence
+                confidence=confidence,
             )
 
             logger.info("pipeline_done | %.2fs", time.time() - start_total)
 
             return {
-                "status": "completed",
-                "url": final_url,
-                "risk_level": risk_level,
-                "overall_score": round(score, 2),
-                "confidence": round(confidence, 4),
-                "risk_factors": patterns,
+                "status":          "completed",
+                "url":             final_url,
+                "risk_level":      risk_level,
+                "overall_score":   round(score, 2),
+                "confidence":      round(confidence, 4),
+                "risk_factors":    patterns,
                 "llm_explanation": llm,
-                "advice": advice,
-                "blacklist": blacklist,
-                "brand_check": brand,
-                "network": network,
-                "page_metadata": metadata,
-                "is_scam": score >= IS_SCAM_THRESHOLD,
-                "screenshot": None,
+                "advice":          advice,
+                "blacklist":       blacklist,
+                "brand_check":     brand,
+                "network":         network,
+                "page_metadata":   metadata,
+                "is_scam":         score >= IS_SCAM_THRESHOLD,
+                "screenshot":      screenshot,
+                "domain_info":     domain_info,
+                # Internal: pass crawl artifacts for deep-analyze reuse (not exposed in API)
+                "_crawl_html":     html,
             }
 
         except Exception as e:
@@ -215,5 +287,6 @@ class URLAnalysisPipeline:
             return {"status": "error", "message": str(e)}
 
 
-def analyze_url(url: str) -> dict:
-    return URLAnalysisPipeline.analyze(url)
+async def analyze_url(url: str) -> dict:
+    """Async entry point for the URL analysis pipeline."""
+    return await URLAnalysisPipeline.analyze(url)

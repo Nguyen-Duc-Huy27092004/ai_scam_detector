@@ -2,7 +2,8 @@
 LLM Explanation Engine — Production Hardened
 
 Improvements:
-- Retry + timeout tuning
+- Groq API support (OpenAI-compatible endpoint)
+- Retry + timeout tuning for cloud APIs
 - Circuit breaker with backoff
 - requests.Session() reuse
 - Safer JSON parsing
@@ -20,22 +21,23 @@ import os
 
 from utils.logger import logger
 from utils.config import LLM_PROVIDER, LLM_MODEL, LLM_BASE_URL, LLM_API_KEY
+from llm.promt_templates import build_url_explanation_prompt, build_text_explanation_prompt
 
 
 # ==========================
 # CONFIG
 # ==========================
 
-LLM_TIMEOUT     = int(os.getenv("LLM_TIMEOUT", "120"))
-LLM_MAX_TOKENS  = int(os.getenv("LLM_MAX_TOKENS", "800"))  # Reduced for faster generation
+# For cloud APIs like Groq, 30s read timeout is more than enough.
+# Ollama local can be slow, but we no longer use it.
+LLM_TIMEOUT     = int(os.getenv("LLM_TIMEOUT", "30"))
+LLM_MAX_TOKENS  = int(os.getenv("LLM_MAX_TOKENS", "512"))
 
 MAX_RETRIES = 2
 
 # Timeout tuple: (connect_timeout, read_timeout)
-# connect_timeout: how long to wait for connection establishment
-# read_timeout: how long to wait for response data
-LLM_CONNECT_TIMEOUT = 10  # Faster connection timeout
-LLM_READ_TIMEOUT = LLM_TIMEOUT    # Use environment variable for read timeout
+LLM_CONNECT_TIMEOUT = 10
+LLM_READ_TIMEOUT = LLM_TIMEOUT
 LLM_REQUEST_TIMEOUT = (LLM_CONNECT_TIMEOUT, LLM_READ_TIMEOUT)
 
 
@@ -103,148 +105,95 @@ def _record_failure():
 # ==========================
 # PROMPT
 # ==========================
-
-def _determine_tone(score: int) -> str:
-    """Select prompt tone directive based on risk score."""
-    if score >= 80:
-        return "CẢNH BÁO MẠNH: Trang này rất nguy hiểm. Dùng giọng nghiêm trọng, khẩn cấp."
-    elif score >= 50:
-        return "THẬN TRỌNG: Trang này đáng ngờ. Dùng giọng cảnh giác nhưng bình tĩnh."
-    return "THÔNG TIN: Trang này có vẻ an toàn. Dùng giọng nhẹ nhàng, hướng dẫn."
-
-
-def build_explanation_prompt(meta: dict) -> str:
-    features = meta.get("metadata", {})
-    score = meta.get("overall_score", 0)
-    risk_level = meta.get("risk_level", "unknown")
-    domain = meta.get("domain", "unknown")
-    factors = ", ".join(meta.get("risk_factors", [])[:5]) or "none"
-    tone = _determine_tone(int(score))
-
-    return f"""Bạn là chuyên gia bảo mật giải thích cho người dùng bình thường.
-
-{tone}
-
-Tín hiệu phát hiện từ trang [{domain}]:
-- Form đăng nhập: {features.get('has_login_form', False)}
-- Form gửi ra ngoài: {features.get('has_external_form', False)}
-- Ô nhập mật khẩu: {features.get('password_inputs', 0)}
-- Liên kết ngoài: {features.get('external_links', 0)}
-- Cụm từ gấp: {features.get('urgency', [])}
-- Từ khóa nghi vấn: {features.get('keywords', [])}
-- Dấu hiệu rủi ro: {factors}
-- Điểm rủi ro: {score}/100
-
-Quy tắc:
-- Viết ngắn, rõ, không dùng thuật ngữ kỹ thuật
-- Tập trung vào hậu quả nếu người dùng tiếp tục
-- Đưa hành động cụ thể
-
-Trả về ĐÚNG JSON (không text ngoài):
-{{
-  "risk_level": "low | medium | high",
-  "analysis_summary": "2-3 câu giải thích đơn giản",
-  "impact": "Hậu quả nếu tiếp tục",
-  "confidence_note": "Lý do kết luận dựa trên dấu hiệu",
-  "recommended_action": "Hành động cụ thể"
-}}"""
+# Prompts are now imported from llm.promt_templates
 
 
 # ==========================
 # LLM CALL
 # ==========================
 
+def _build_endpoint() -> str:
+    """
+    Build the correct chat completions endpoint.
+
+    LLM_BASE_URL may already contain '/v1' (e.g. 'https://api.groq.com/openai/v1')
+    or may be a bare host (e.g. 'http://localhost:11434').
+    We normalise so the final URL always ends in '/chat/completions'.
+    """
+    base = LLM_BASE_URL.rstrip("/")
+    # Already ends with /v1  →  just append /chat/completions
+    if base.endswith("/v1"):
+        return f"{base}/chat/completions"
+    # Already ends with /chat/completions (idempotent)
+    if base.endswith("/chat/completions"):
+        return base
+    # Bare OpenAI-compatible host  →  append /v1/chat/completions
+    return f"{base}/v1/chat/completions"
+
+
 def call_llm(prompt: str) -> Optional[str]:
     if _circuit_is_open():
         logger.info("llm_circuit_open_skip")
         return None
 
-    for attempt in range(MAX_RETRIES):
+    endpoint = _build_endpoint()
 
+    for attempt in range(MAX_RETRIES):
         try:
             logger.info(
-                "llm_request | len=%d | attempt=%d | provider=%s",
+                "llm_request | len=%d | attempt=%d | provider=%s | endpoint=%s",
                 len(prompt),
                 attempt,
                 LLM_PROVIDER,
+                endpoint,
             )
 
-            if LLM_PROVIDER == "ollama":
-                try:
-                    resp = _session.post(
-                        f"{LLM_BASE_URL.rstrip('/')}/api/generate",
-                        json={
-                            "model": LLM_MODEL,
-                            "prompt": prompt,
-                            "stream": False,
-                            "options": {
-                                "temperature": 0.1,
-                                "num_predict": 256,
-                                "num_ctx": 1024,
-                                "top_k": 40,
-                                "top_p": 0.9,
-                            },
-                        },
-                        timeout=LLM_REQUEST_TIMEOUT,
-                    )
+            resp = _session.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {LLM_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": LLM_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "max_tokens": LLM_MAX_TOKENS,
+                },
+                timeout=LLM_REQUEST_TIMEOUT,
+            )
 
-                    if resp.status_code == 200:
-                        _record_success()
-                        logger.debug("llm_response_received | size=%d", len(resp.text))
-                        return resp.json().get("response", "")
-                except requests.ConnectTimeout:
-                    logger.warning("llm_connect_timeout_attempt_%d", attempt)
-                    continue
-                except requests.ReadTimeout:
-                    logger.warning("llm_read_timeout_attempt_%d", attempt)
-                    continue
+            if resp.status_code == 200:
+                _record_success()
+                logger.debug("llm_response_received | size=%d", len(resp.text))
+                return resp.json()["choices"][0]["message"]["content"]
 
-            elif LLM_PROVIDER in ("openai", "gemini"):
-                try:
-                    resp = _session.post(
-                        f"{LLM_BASE_URL.rstrip('/')}/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {LLM_API_KEY}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "model": LLM_MODEL,
-                            "messages": [{"role": "user", "content": prompt}],
-                            "temperature": 0.1,
-                            "max_tokens": 200,
-                        },
-                        timeout=LLM_REQUEST_TIMEOUT,
-                    )
 
-                    if resp.status_code == 200:
-                        _record_success()
-                        logger.debug("llm_response_received | size=%d", len(resp.text))
-                        return resp.json()["choices"][0]["message"]["content"]
-                except requests.ConnectTimeout:
-                    logger.warning("llm_connect_timeout_attempt_%d", attempt)
-                    continue
-                except requests.ReadTimeout:
-                    logger.warning("llm_read_timeout_attempt_%d", attempt)
-                    continue
+            logger.warning(
+                "llm_bad_status | attempt=%d | status=%d | body=%s",
+                attempt,
+                resp.status_code,
+                resp.text[:300],
+            )
 
-            if 'resp' in locals():
-                logger.warning(
-                    "llm_bad_status | attempt=%d | status=%s | body_len=%d",
-                    attempt,
-                    resp.status_code,
-                    len(resp.text) if resp.text else 0,
-                )
-            else:
-                logger.warning(
-                    "llm_no_response | attempt=%d",
-                    attempt,
-                )
 
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", "5"))
+                logger.info("llm_rate_limited | waiting=%ds", retry_after)
+                time.sleep(retry_after)
+                continue
+
+            if 400 <= resp.status_code < 500:
+                break
+
+        except requests.ConnectTimeout:
+            logger.warning("llm_connect_timeout | attempt=%d", attempt)
+        except requests.ReadTimeout:
+            logger.warning("llm_read_timeout | attempt=%d | timeout=%ds", attempt, LLM_READ_TIMEOUT)
         except requests.Timeout as e:
-            logger.warning("llm_timeout_attempt_%d | type=%s", attempt, type(e).__name__)
-
+            logger.warning("llm_timeout | attempt=%d | type=%s", attempt, type(e).__name__)
         except Exception as e:
-            logger.warning("llm_error_attempt_%d | %s", attempt, str(e)[:200])
+            logger.warning("llm_error | attempt=%d | %s", attempt, str(e)[:200])
 
     _record_failure()
     return None
@@ -254,64 +203,55 @@ def call_llm(prompt: str) -> Optional[str]:
 # JSON PARSER (SAFE)
 # ==========================
 
-def _extract_json(text: str) -> Optional[dict]:
+def _extract_json(text: str) -> tuple[Optional[dict], str]:
     if not text:
-        return None
+        return None, "Empty text"
 
     text = text.strip()
     
-    logger.debug("llm_extract_json | input_len=%d | first_50=%s", len(text), text[:50])
-
     # remove markdown code blocks
     if "```" in text:
         parts = text.split("```")
         if len(parts) >= 3:
-            # extract content between first and second ```
             text = parts[1]
         elif len(parts) == 2:
-            # only one ``` found, try the second part
             text = parts[1]
         text = text.replace("json", "").replace("JSON", "").strip()
-        logger.debug("llm_markdown_stripped | new_len=%d", len(text))
 
     # try direct parse first
+    err_msg = ""
     try:
-        data = json.loads(text)
-        logger.info("llm_json_direct_parse_success")
-        return data
+        # Prevent common LLM error: trailing commas
+        text_clean = re.sub(r',\s*([\]}])', r'\1', text)
+        data = json.loads(text_clean)
+        return data, "success"
     except json.JSONDecodeError as e:
-        logger.debug("llm_json_direct_parse_failed | error=%s", str(e)[:100])
+        err_msg = str(e)
 
     # more aggressive search for JSON object
-    # handle cases where there's text before/after JSON
     start_idx = text.find('{')
     end_idx = text.rfind('}')
     
     if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
         json_candidate = text[start_idx:end_idx + 1]
-        logger.debug("llm_json_extracted_substring | len=%d", len(json_candidate))
         try:
-            data = json.loads(json_candidate)
-            logger.info("llm_json_substring_parse_success")
-            return data
+            candidate_clean = re.sub(r',\s*([\]}])', r'\1', json_candidate)
+            data = json.loads(candidate_clean)
+            return data, "success"
         except json.JSONDecodeError as e:
-            logger.debug("llm_json_substring_parse_failed | error=%s", str(e)[:100])
+            err_msg = str(e)
 
-    # fallback: try regex with non-greedy matching
+    # fallback: try regex
     matches = re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL)
-    logger.debug("llm_regex_matches_found | count=%d", len(matches))
-
-    for i, m in enumerate(matches):
+    for m in matches:
         try:
-            data = json.loads(m)
-            logger.info("llm_json_regex_parse_success | match_idx=%d", i)
-            return data
-        except json.JSONDecodeError as e:
-            logger.debug("llm_regex_match_%d_failed | len=%d", i, len(m))
+            m_clean = re.sub(r',\s*([\]}])', r'\1', m)
+            data = json.loads(m_clean)
+            return data, "success"
+        except json.JSONDecodeError:
             continue
 
-    logger.warning("llm_json_extraction_all_failed | input=%s", text[:200])
-    return None
+    return None, f"Parse err: {err_msg} | raw: {text[:40]}"
 
 
 # ==========================
@@ -319,16 +259,26 @@ def _extract_json(text: str) -> Optional[dict]:
 # ==========================
 
 def _normalize(data: dict, fallback: dict) -> dict:
+    """Pass LLM output fields through to fusion layer (minimal processing)."""
+    # Validate site_type
+    _valid_types = {"safe", "suspicious", "scam", "adult", "unknown"}
+    site_type = str(data.get("site_type") or "unknown").lower().strip()
+    if site_type not in _valid_types:
+        site_type = "unknown"
+
     return {
-        "risk_score": data.get("risk_score", fallback["score"]),
-        "risk_level": data.get("risk_level", fallback["risk_level"]),
-        "detected_signals": data.get("detected_signals", fallback["factors"][:5]),
-        "analysis_summary": data.get("analysis_summary") or "Không có phân tích.",
-        "website_summary": data.get("website_summary", "Không có thông tin website."),
-        "impact": data.get("impact") or "Chưa xác định được hậu quả cụ thể.",
-        "confidence_note": data.get("confidence_note") or "Dựa trên các tín hiệu tự động.",
-        "recommended_action": data.get("recommended_action") or "Hãy cẩn trọng.",
+        "site_type":        site_type,
+        "content_summary":  data.get("content_summary") or _NO_DATA,
+        "behavior_summary": data.get("behavior_summary") or _NO_BEHAVIOR,
+        "analysis_summary": data.get("analysis_summary") or _NO_DATA,
+        "conflict_hint":    str(data.get("conflict_hint") or "").lower().strip(),
+        # These fields are intentionally omitted — fusion layer injects them:
+        # risk_level, score, recommended_action, warnings
     }
+
+
+_NO_DATA     = "Không đủ dữ liệu."
+_NO_BEHAVIOR = "Không phát hiện hành vi đáng chú ý."
 
 
 # ==========================
@@ -340,7 +290,10 @@ def generate_explanation(meta: dict) -> dict:
     risk_level = meta.get("risk_level", "suspicious")
     factors = meta.get("risk_factors", [])
 
-    prompt = build_explanation_prompt(meta)
+    if meta.get("scam_type") == "text_scam":
+        prompt = build_text_explanation_prompt(meta)
+    else:
+        prompt = build_url_explanation_prompt(meta)
 
     start = time.monotonic()
     raw = call_llm(prompt)
@@ -348,12 +301,43 @@ def generate_explanation(meta: dict) -> dict:
 
     logger.info("llm_done | elapsed=%.2fs | success=%s", elapsed, raw is not None)
 
+    # ==========================
+    # VALIDATE + PARSE
+    # ==========================
     if raw:
-        # Always log raw response for debugging when parsing fails
-        logger.debug("llm_raw_response | len=%d | content=%s", len(raw), raw[:500])
+        logger.debug("llm_raw_response | len=%d", len(raw))
 
-        parsed = _extract_json(raw)
-        if parsed:
+        # ---- Guard 1: truncate để tránh payload quá lớn
+        if len(raw) > 2000:
+            raw = raw[:2000]
+
+        # ---- Guard 2: detect prompt leakage
+        LEAK_PATTERNS = [
+            "Bạn là chuyên gia",
+            "Tóm tắt nội dung",
+            "Form đăng nhập",
+            "Risk Analysis",
+            "Confidence:",
+        ]
+        if any(p in raw for p in LEAK_PATTERNS):
+            logger.warning("llm_prompt_leak_detected")
+            raw = None
+
+        parsed, err_reason = _extract_json(raw) if raw else (None, "prompt_leak")
+
+        # ---- Guard 3: accept new schema (content_summary or analysis_summary)
+        REQUIRED_KEYS = ["site_type", "analysis_summary"]
+        # Also accept old schema gracefully
+        ALT_KEYS = ["content_summary"]
+
+        if (
+            parsed
+            and isinstance(parsed, dict)
+            and (
+                all(k in parsed for k in REQUIRED_KEYS)
+                or any(k in parsed for k in ALT_KEYS)
+            )
+        ):
             logger.info("llm_json_parsed | success | keys=%s", list(parsed.keys()))
             return _normalize(parsed, {
                 "score": score,
@@ -361,16 +345,22 @@ def generate_explanation(meta: dict) -> dict:
                 "factors": factors,
             })
 
-        logger.warning("llm_json_parse_failed | raw_len=%d | raw_start=%s", len(raw), raw[:100])
+        logger.warning(
+            "llm_json_parse_failed | reason=%s | raw_len=%s",
+            err_reason,
+            len(raw) if raw else 0
+        )
 
+    # ==========================
+    # HARD FALLBACK (user-friendly)
+    # ==========================
     logger.warning("llm_fallback_used | elapsed=%.2fs", elapsed)
 
     return {
-        "risk_score": score,
-        "risk_level": risk_level,
-        "detected_signals": factors[:5],
-        "analysis_summary": "Hệ thống chưa thể đưa ra đánh giá chi tiết.",
-        "impact": "Chưa xác định. Hãy thận trọng khi tương tác.",
-        "confidence_note": "Phân tích tự động dựa trên các dấu hiệu kỹ thuật.",
-        "recommended_action": "Không nên tin tưởng, hãy kiểm tra thủ công.",
+        "site_type":        "safe" if score < 30 else ("suspicious" if score < 60 else "scam"),
+        "content_summary":  _NO_DATA,
+        "behavior_summary": _NO_BEHAVIOR,
+        "analysis_summary": _NO_DATA,
+        "conflict_hint":    "",
+        # risk_level, recommended_action, warnings injected by fusion layer
     }

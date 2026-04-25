@@ -109,12 +109,12 @@ class SecureCrawler:
                             return await cls._fetch(session, next_url, depth + 1)
                     return None
 
-                if resp.status != 200:
-                    logger.debug("non_200 | status=%d | url=%s", resp.status, url[:80])
+                if resp.status >= 500:
+                    logger.debug("server_error | status=%d | url=%s", resp.status, url[:80])
                     return None
 
                 content_type = resp.headers.get("Content-Type", "")
-                if "text/html" not in content_type:
+                if "text/html" not in content_type and "text/plain" not in content_type:
                     logger.debug("non_html | content_type=%s | url=%s", content_type, url[:80])
                     return None
 
@@ -190,55 +190,84 @@ class SecureCrawler:
     @classmethod
     async def crawl(cls, url: str) -> Dict[str, Any]:
         """Crawl a URL and return structured result dict."""
-        connector = aiohttp.TCPConnector(
-            ssl=_SSL_CONTEXT,
-            limit=10,
-            ttl_dns_cache=300,
-        )
+        try:
+            connector = aiohttp.TCPConnector(
+                ssl=_SSL_CONTEXT,
+                limit=10,
+                ttl_dns_cache=300,
+            )
 
-        async with aiohttp.ClientSession(
-            timeout=cls.TIMEOUT,
-            connector=connector,
-        ) as session:
-            try:
-                html = await asyncio.wait_for(
-                    cls._fetch(session, url),
-                    timeout=30,
-                )
-            except asyncio.TimeoutError:
-                logger.debug("crawl_global_timeout | url=%s", url[:80])
+            async with aiohttp.ClientSession(
+                timeout=cls.TIMEOUT,
+                connector=connector,
+            ) as session:
+                try:
+                    html = await asyncio.wait_for(
+                        cls._fetch(session, url),
+                        timeout=30,
+                    )
+                except asyncio.TimeoutError:
+                    logger.debug("crawl_global_timeout | url=%s", url[:80])
+                    return cls._fail(url)
+
+            if not html:
                 return cls._fail(url)
 
-        if not html:
+            return {
+                "success": True,
+                "html": html,
+                "text": cls.extract_text(html),
+                "final_url": url,
+            }
+        except socket.gaierror as e:
+            logger.warning("crawl_dns_error | url=%s | error=%s", url[:80], str(e))
             return cls._fail(url)
-
-        return {
-            "success": True,
-            "html": html,
-            "text": cls.extract_text(html),
-            "final_url": url,
-        }
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning("crawl_client_error | url=%s | error=%s", url[:80], str(e))
+            return cls._fail(url)
+        except Exception as e:
+            logger.error("crawl_unexpected_error | url=%s | error=%s | type=%s", 
+                        url[:80], str(e), type(e).__name__, exc_info=True)
+            return cls._fail(url)
 
     # ========================
     # SYNC WRAPPER (thread-safe)
     # ========================
 
     @classmethod
-    def crawl_sync(cls, url: str) -> Dict[str, Any]:
+    def crawl_sync(cls, url: str, max_retries: int = 2) -> Dict[str, Any]:
         """
         Synchronous wrapper — safe to call from threads (creates its own event loop).
         Do NOT call this from within an already-running async context; use crawl() instead.
+        
+        Retries on DNS/network failures with exponential backoff.
         """
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        import time
+        
+        backoff = 1  # seconds
+        
+        for attempt in range(max_retries + 1):
             try:
-                return loop.run_until_complete(cls.crawl(url))
-            finally:
-                loop.close()
-        except Exception as e:
-            logger.debug("crawl_sync_error | url=%s | %s", url[:80], str(e))
-            return cls._fail(url)
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    return loop.run_until_complete(cls.crawl(url))
+                finally:
+                    loop.close()
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.warning(
+                        "crawl_sync_retry | url=%s | attempt=%d/%d | error=%s",
+                        url[:80], attempt + 1, max_retries + 1, str(e)
+                    )
+                    time.sleep(backoff)
+                    backoff *= 2
+                else:
+                    logger.error(
+                        "crawl_sync_failed_final | url=%s | error=%s | type=%s",
+                        url[:80], str(e), type(e).__name__, exc_info=True
+                    )
+                    return cls._fail(url)
 
     # ========================
     # FAIL SAFE
