@@ -25,9 +25,6 @@ data/**/*.png
 data/**/*.jpg
 data/**/*.jpeg
 
-models/**/*.pkl
-models/**/*.h5
-models/**/*.joblib
 
 # =========================
 # Logs
