@@ -112,6 +112,20 @@ class DeepURLAnalyzer:
         details["keyword_hits"] = hits
 
         # =====================
+        # 2b. GAMBLING ANALYSIS
+        # =====================
+        gambling_keywords = [
+            "cổng game", "rikvip", "casino", "betting", "tài xỉu", 
+            "nổ hũ", "đánh bài", "cá cược", "game bài", "lô đề"
+        ]
+        gambling_hits = [k for k in gambling_keywords if k in text]
+        
+        if gambling_hits:
+            signals.append("gambling_site")
+            risk_score += 50
+            details["gambling_hits"] = gambling_hits
+
+        # =====================
         # 3. IFRAME ANALYSIS
         # =====================
         iframes = soup.find_all("iframe")

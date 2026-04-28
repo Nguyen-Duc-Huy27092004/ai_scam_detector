@@ -279,6 +279,13 @@ class ContentExtractor:
                 "update information", "click here"
             ]
 
+            gambling_keywords = [
+                "cổng game", "rikvip", "casino", "betting", "tài xỉu", 
+                "nổ hũ", "đánh bài", "cá cược", "game bài", "lô đề"
+            ]
+
+            metadata["gambling_keywords"] = []
+
             for kw in urgency_keywords:
                 if kw in body_text:
                     metadata["urgency_phrases"].append(kw)
@@ -286,6 +293,10 @@ class ContentExtractor:
             for kw in suspicious_keywords:
                 if kw in body_text:
                     metadata["suspicious_keywords"].append(kw)
+
+            for kw in gambling_keywords:
+                if kw in body_text:
+                    metadata["gambling_keywords"].append(kw)
 
             # Buttons
             for btn in soup.find_all(["button", "a"]):

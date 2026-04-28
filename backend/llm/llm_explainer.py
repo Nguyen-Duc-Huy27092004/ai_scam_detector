@@ -260,8 +260,7 @@ def _extract_json(text: str) -> tuple[Optional[dict], str]:
 
 def _normalize(data: dict, fallback: dict) -> dict:
     """Pass LLM output fields through to fusion layer (minimal processing)."""
-    # Validate site_type
-    _valid_types = {"safe", "suspicious", "scam", "adult", "unknown"}
+    _valid_types = {"safe", "suspicious", "scam", "adult", "gambling", "unknown"}
     site_type = str(data.get("site_type") or "unknown").lower().strip()
     if site_type not in _valid_types:
         site_type = "unknown"

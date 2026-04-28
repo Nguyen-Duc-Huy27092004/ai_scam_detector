@@ -13,12 +13,20 @@ SSRF Hardening Notes:
 
 import ipaddress
 import socket
+import concurrent.futures
 from urllib.parse import urlparse
 
 from urllib.parse import urlparse
 import re
 
 from utils.logger import logger
+
+
+# DNS resolution timeout (seconds) — socket.getaddrinfo() has no built-in timeout
+_DNS_TIMEOUT = 5
+_DNS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="ssrf-dns"
+)
 
 
 # =============================================
@@ -73,31 +81,55 @@ def is_safe_url(url: str) -> bool:
     """
     SSRF protection: reject URLs that resolve to private/internal IP addresses.
 
+    Returns True if the URL is safe to fetch, False otherwise.
+
     This must be called BEFORE any outbound HTTP request.
-    Note: a short DNS rebinding window remains between this call and the actual
-    HTTP connection. Use short connect timeouts to minimize exposure.
+    
+    Note: DNS resolution uses a 5-second timeout to prevent blocking on slow
+    resolvers. A short DNS rebinding window remains between this call and the
+    actual HTTP connection. Use short connect timeouts to minimize exposure.
+    """
+    safe, _ = is_safe_url_detailed(url)
+    return safe
+
+
+def is_safe_url_detailed(url: str) -> tuple[bool, str]:
+    """
+    Like is_safe_url() but also returns a human-readable reason string.
+    Use this in API endpoints to provide accurate error messages.
+
+    Returns: (is_safe: bool, reason: str)
+      reason is one of:
+        "ok"                   — URL is safe
+        "invalid_url"          — malformed URL / no hostname
+        "disallowed_scheme"    — not http/https
+        "localhost"            — explicit localhost / loopback literal
+        "internal_tld"         — .local / .internal / .lan etc.
+        "metadata_host"        — cloud metadata endpoint
+        "dns_resolution_failed"— DNS lookup failed (NXDOMAIN, timeout, etc.)
+        "private_ip"           — domain resolves to a private/reserved IP
     """
     try:
         parsed = urlparse(url)
         hostname = parsed.hostname
 
         if not hostname:
-            return False
+            return False, "invalid_url"
 
         # Reject scheme-level tricks
         if parsed.scheme not in ("http", "https"):
             logger.warning("ssrf_blocked | hostname=%s | reason=disallowed_scheme | scheme=%s", hostname, parsed.scheme)
-            return False
+            return False, "disallowed_scheme"
 
         # Reject obvious local hostnames
         if hostname.lower() in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
             logger.warning("ssrf_blocked | hostname=%s | reason=localhost_literal", hostname)
-            return False
+            return False, "localhost"
 
         # Reject internal TLDs
         if hostname.endswith((".local", ".internal", ".host", ".lan", ".home", ".test", ".invalid", ".example")):
             logger.warning("ssrf_blocked | hostname=%s | reason=internal_tld", hostname)
-            return False
+            return False, "internal_tld"
 
         # Reject cloud metadata hostnames (string-level guard)
         _METADATA_HOSTS = (
@@ -106,18 +138,21 @@ def is_safe_url(url: str) -> bool:
         )
         if any(m in hostname for m in _METADATA_HOSTS):
             logger.warning("ssrf_blocked | hostname=%s | reason=metadata_host", hostname)
-            return False
+            return False, "metadata_host"
 
-        # Resolve hostname — treat DNS failure as unsafe
+        # Resolve hostname with timeout — getaddrinfo() can block indefinitely
         try:
-            # getaddrinfo returns all records (handles IPv6 as well)
-            records = socket.getaddrinfo(hostname, None)
+            future = _DNS_EXECUTOR.submit(socket.getaddrinfo, hostname, None)
+            records = future.result(timeout=_DNS_TIMEOUT)
             if not records:
                 logger.warning("ssrf_blocked | hostname=%s | reason=no_dns_records", hostname)
-                return False
+                return False, "dns_resolution_failed"
+        except concurrent.futures.TimeoutError:
+            logger.warning("ssrf_blocked | hostname=%s | reason=dns_timeout", hostname)
+            return False, "dns_resolution_failed"
         except (socket.gaierror, OSError):
             logger.warning("ssrf_blocked | hostname=%s | reason=dns_resolution_failed", hostname)
-            return False
+            return False, "dns_resolution_failed"
 
         # Check every resolved IP — block if ANY resolves to a private range
         for record in records:
@@ -127,13 +162,13 @@ def is_safe_url(url: str) -> bool:
                     "ssrf_blocked | hostname=%s | ip=%s | reason=private_ip",
                     hostname, ip_str,
                 )
-                return False
+                return False, "private_ip"
 
-        return True
+        return True, "ok"
 
     except Exception as e:
         logger.warning("ssrf_check_error | url=%.100s | error=%s", url, str(e))
-        return False
+        return False, "invalid_url"
 
 
 def normalize_url(url: str) -> str:

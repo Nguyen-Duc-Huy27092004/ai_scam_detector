@@ -45,6 +45,8 @@ class DatabaseConnection:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_input_type ON analysis_history(input_type)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON analysis_history(timestamp)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_risk_level ON analysis_history(risk_level)")
+            # Composite index for cache-hit lookups: WHERE input_type = ? AND input_value = ?
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_input_value ON analysis_history(input_type, input_value)")
 
             conn.commit()
             conn.close()
@@ -159,6 +161,18 @@ class AnalysisHistory:
             LIMIT ? OFFSET ?
         """
         return db.execute_query(query, (input_type, limit, offset))
+
+    @staticmethod
+    def get_by_input_value(input_type: str, input_value: str) -> Optional[Dict]:
+        db = get_db()
+        query = """
+            SELECT * FROM analysis_history
+            WHERE input_type = ? AND input_value = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        results = db.execute_query(query, (input_type, input_value))
+        return results[0] if results else None
 
     @staticmethod
     def get_by_risk_level(risk_level: str, limit=100, offset=0) -> List[Dict]:

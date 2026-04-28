@@ -26,8 +26,9 @@ _ANTI_HALLUCINATION = """
 2. Nếu dữ liệu thiếu hoặc không rõ → trả về chuỗi "Không đủ dữ liệu".
 3. KHÔNG mô tả nội dung website nếu không có trong Content Snippet.
 4. KHÔNG kết luận website "an toàn tuyệt đối" hay "chắc chắn lừa đảo".
-5. "site_type" chỉ được chọn từ: safe | suspicious | scam | adult | unknown
-   - "adult": chỉ khi tín hiệu adult_content/18plus xuất hiện trong dữ liệu.
+5. "site_type" chỉ được chọn từ: safe | suspicious | scam | adult | gambling | unknown
+   - "adult": website chứa nội dung người lớn, 18+.
+   - "gambling": website cờ bạc, cá cược trực tuyến (casino, betting, lô đề).
    - "unknown": khi không đủ dữ liệu để phân loại.
    - Mặc định: dùng "safe" với risk thấp, không có tín hiệu đáng ngờ.
 6. KHÔNG trả về: risk_level, risk_score, score, recommended_action.
@@ -53,7 +54,11 @@ def build_url_explanation_prompt(meta: dict) -> str:
     urgency     = ", ".join((page.get("urgency") or [])[:3]) or "none"
     keywords    = ", ".join((page.get("keywords") or [])[:3]) or "none"
 
-    signals_text = "\n".join(f"  - {f}" for f in factors[:12]) if factors else "  - (không có tín hiệu)"
+    try:
+        from services.llm_fusion import _label as get_signal_label
+        signals_text = "\n".join(f"  - {get_signal_label(f)}" for f in factors[:12]) if factors else "  - (không có tín hiệu)"
+    except ImportError:
+        signals_text = "\n".join(f"  - {f}" for f in factors[:12]) if factors else "  - (không có tín hiệu)"
 
     return f"""Bạn là chuyên gia phân tích nội dung web cho hệ thống bảo mật. Viết bằng tiếng Việt.
 
@@ -83,11 +88,11 @@ Bạn KHÔNG được đưa ra kết luận về risk hay score.
 === OUTPUT FORMAT ===
 Trả về JSON sau (tất cả giá trị bằng tiếng Việt):
 {{
-  "site_type": "safe | suspicious | scam | adult | unknown",
+  "site_type": "safe | suspicious | scam | adult | gambling | unknown",
   "content_summary": "2-3 câu mô tả website làm gì, phục vụ ai — CHỈ dựa vào Title và Content Snip. Nếu không đủ dữ liệu → 'Không đủ dữ liệu'.",
   "behavior_summary": "Mô tả hành vi kỹ thuật: có form đăng nhập không? redirect? thu thập dữ liệu gì? Dựa VÀO tín hiệu kỹ thuật ở trên. Nếu không có tín hiệu → 'Không phát hiện hành vi đáng chú ý'.",
   "analysis_summary": "Giải thích tại sao score = {score}/100: liên hệ trực tiếp từng tín hiệu với điểm rủi ro. Không đoán thêm.",
-  "conflict_hint": "safe | suspicious | scam — đánh giá của bạn về nội dung (KHÔNG phải risk_level). Dùng để phát hiện conflict với Risk Engine."
+  "conflict_hint": "safe | suspicious | scam | adult | gambling — đánh giá của bạn về nội dung (KHÔNG phải risk_level). Nếu là trang người lớn, hãy trả về 'adult'. Nếu là cờ bạc, trả về 'gambling'."
 }}"""
 
 
@@ -97,7 +102,11 @@ def build_text_explanation_prompt(meta: dict) -> str:
     content = (meta.get("content_summary") or "")[:400]
     tone    = _determine_tone(score)
 
-    signals_text = "\n".join(f"  - {f}" for f in factors[:8]) if factors else "  - (không có tín hiệu)"
+    try:
+        from services.llm_fusion import _label as get_signal_label
+        signals_text = "\n".join(f"  - {get_signal_label(f)}" for f in factors[:8]) if factors else "  - (không có tín hiệu)"
+    except ImportError:
+        signals_text = "\n".join(f"  - {f}" for f in factors[:8]) if factors else "  - (không có tín hiệu)"
 
     return f"""Bạn là chuyên gia phân tích nội dung tin nhắn/văn bản cho hệ thống bảo mật. Viết bằng tiếng Việt.
 

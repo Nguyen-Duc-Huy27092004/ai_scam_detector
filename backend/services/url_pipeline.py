@@ -11,6 +11,7 @@ Production hardened:
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any
 from urllib.parse import urlparse
+import asyncio
 import time
 
 from utils.logger import logger
@@ -29,6 +30,7 @@ from services.content_extractor import ContentExtractor
 from services.file_analyzer import FileAnalyzer
 from services.screenshot import ScreenshotService
 from services.domain_info import get_domain_info
+from services.hudson_rock import check_hudson_rock
 
 from ml.url.predict import predict_url
 from llm.llm_explainer import generate_explanation
@@ -94,6 +96,8 @@ class URLAnalysisPipeline:
             f_brand       = loop.run_in_executor(_IO_EXECUTOR, detect_brand_impersonation, domain)
             f_domain_info = loop.run_in_executor(_IO_EXECUTOR, get_domain_info, domain)
             f_screenshot  = loop.run_in_executor(_IO_EXECUTOR, ScreenshotService.capture, final_url)
+            # Hudson Rock: infostealer credential leak check (non-blocking, 8s timeout)
+            f_hudson      = loop.run_in_executor(_IO_EXECUTOR, check_hudson_rock, final_url)
 
             results = await asyncio.gather(
                 asyncio.wait_for(f_crawl,       timeout=10),
@@ -101,11 +105,12 @@ class URLAnalysisPipeline:
                 asyncio.wait_for(f_network,     timeout=6),
                 asyncio.wait_for(f_brand,       timeout=5),
                 asyncio.wait_for(f_domain_info, timeout=5),
+                asyncio.wait_for(f_hudson,      timeout=8),
                 return_exceptions=True,
             )
 
             def _safe(r): return r if isinstance(r, dict) else {}
-            crawl, intel, network, brand, domain_info = map(_safe, results)
+            crawl, intel, network, brand, domain_info, hudson = map(_safe, results)
 
             try:
                 screenshot = await asyncio.wait_for(f_screenshot, timeout=15)
@@ -186,9 +191,15 @@ class URLAnalysisPipeline:
             if metadata.get("has_login_form"):   patterns.append("login_form")
             if metadata.get("has_otp_field"):    patterns.append("otp_request")
             if metadata.get("urgency_phrases"):  patterns.append("urgency_detected")
+            if metadata.get("gambling_keywords"): patterns.append("gambling_site")
             if brand.get("is_impersonating"):    patterns.append("brand_impersonation")
             if blacklist.get("is_blacklisted"):  patterns.append("blacklisted_url")
             if has_dangerous_files:              patterns.append("malicious_file_download")
+
+            # Hudson Rock — infostealer credential leak
+            hudson_signal = hudson.get("signal")
+            if hudson_signal:
+                patterns.append(hudson_signal)
 
             patterns = list(set(patterns))[:15]
 
@@ -237,7 +248,7 @@ class URLAnalysisPipeline:
                     "content_summary": wrapped_content or metadata.get("description") or "",
                 })
 
-                llm_raw = await asyncio.wait_for(llm_future, timeout=45) or {}
+                llm_raw = await asyncio.wait_for(llm_future, timeout=25) or {}
 
                 llm = fuse_llm_with_risk(
                     risk_level=risk_level,
@@ -250,12 +261,16 @@ class URLAnalysisPipeline:
             except Exception as e:
                 logger.warning("llm_fail | %s", str(e))
 
+            # Extract final fused values if available
+            final_risk_level = llm.get("risk_level", risk_level) if isinstance(llm, dict) else risk_level
+            final_score      = llm.get("score", score) if isinstance(llm, dict) else score
+
             # ========================
             # 9. ADVICE
             # ========================
             advice = generate_advice(
                 analysis_type="url",
-                risk_level=risk_level,
+                risk_level=final_risk_level,
                 risk_factors=patterns,
                 confidence=confidence,
             )
@@ -265,8 +280,8 @@ class URLAnalysisPipeline:
             return {
                 "status":          "completed",
                 "url":             final_url,
-                "risk_level":      risk_level,
-                "overall_score":   round(score, 2),
+                "risk_level":      final_risk_level,
+                "overall_score":   round(final_score, 2),
                 "confidence":      round(confidence, 4),
                 "risk_factors":    patterns,
                 "llm_explanation": llm,
@@ -275,9 +290,10 @@ class URLAnalysisPipeline:
                 "brand_check":     brand,
                 "network":         network,
                 "page_metadata":   metadata,
-                "is_scam":         score >= IS_SCAM_THRESHOLD,
+                "is_scam":         final_score >= IS_SCAM_THRESHOLD,
                 "screenshot":      screenshot,
                 "domain_info":     domain_info,
+                "hudson_rock":     hudson,
                 # Internal: pass crawl artifacts for deep-analyze reuse (not exposed in API)
                 "_crawl_html":     html,
             }
@@ -288,5 +304,14 @@ class URLAnalysisPipeline:
 
 
 async def analyze_url(url: str) -> dict:
-    """Async entry point for the URL analysis pipeline."""
-    return await URLAnalysisPipeline.analyze(url)
+    """Async entry point for the URL analysis pipeline.
+    
+    Hard cap: 70 s total. If the pipeline (crawl + LLM + etc.) does not
+    complete in time we return a structured error instead of hanging forever
+    and causing the frontend AbortController to fire with a cryptic message.
+    """
+    try:
+        return await asyncio.wait_for(URLAnalysisPipeline.analyze(url), timeout=70)
+    except asyncio.TimeoutError:
+        logger.warning("pipeline_total_timeout | url=%s", url[:120])
+        return {"status": "error", "message": "Phân tích mất quá nhiều thời gian. Vui lòng thử lại."}

@@ -13,6 +13,14 @@ try:
     import pytesseract
     from pytesseract import Output
     from PIL import Image
+    import sys
+    import os
+
+    # Fallback path for Windows users who haven't added Tesseract to PATH
+    if sys.platform == "win32":
+        default_tesseract_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        if os.path.exists(default_tesseract_path):
+            pytesseract.pytesseract.tesseract_cmd = default_tesseract_path
 
     OCR_AVAILABLE = True
 except ImportError:

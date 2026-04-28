@@ -73,7 +73,7 @@ def inspect_ssl(url: str) -> dict:
             result["suspicious_signals"].append("no_https")
             return result
 
-        # ── Primary: verified TLS handshake ──────────────────────────────────
+        # Primary: verified TLS handshake 
         context = ssl.create_default_context()
         context.check_hostname = True
         context.verify_mode    = ssl.CERT_REQUIRED
@@ -92,7 +92,7 @@ def inspect_ssl(url: str) -> dict:
             result["suspicious_signals"].append("ssl_verification_failed")
             result["error"] = str(e)
 
-            # ── Fallback: read cert data without verification ─────────────────
+            # Fallback: read cert data without verification
             # Store in a separate variable to avoid overwriting verified data.
             unverified_cert = None
             ctx_noverify = ssl.create_default_context()
@@ -120,11 +120,11 @@ def inspect_ssl(url: str) -> dict:
             result["error"] = "Empty certificate"
             return result
 
-        # ── Parse Subject ─────────────────────────────────────────────────────
+        #  Parse Subject 
         subject_dict = dict(x[0] for x in cert.get("subject", []))
         result["subject"] = subject_dict.get("commonName", "")
 
-        # ── Parse Issuer ──────────────────────────────────────────────────────
+        # Parse Issuer 
         issuer_dict  = dict(x[0] for x in cert.get("issuer", []))
         issuer_org   = issuer_dict.get("organizationName", "")
         issuer_cn    = issuer_dict.get("commonName", "")
@@ -139,7 +139,7 @@ def inspect_ssl(url: str) -> dict:
             result["is_self_signed"] = True
             result["suspicious_signals"].append("self_signed_certificate")
 
-        # ── Parse Dates ───────────────────────────────────────────────────────
+        # Parse Dates 
         now = datetime.now(tz=timezone.utc)
 
         not_after_str = cert.get("notAfter", "")
@@ -169,7 +169,7 @@ def inspect_ssl(url: str) -> dict:
             except ValueError:
                 pass
 
-        # ── Issuer trust level ────────────────────────────────────────────────
+        # Issuer trust level
         issuer_lower = result["issuer"].lower() if result["issuer"] else ""
         if any(t in issuer_lower for t in _HIGH_TRUST_ISSUERS):
             result["issuer_trust"] = "high"

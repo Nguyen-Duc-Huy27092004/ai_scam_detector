@@ -71,6 +71,11 @@ PATTERN_WEIGHTS = {
     "many_hidden_inputs":     10,
     "blacklisted_url":        50,  # Hard blacklist hit
     "datacenter_ip":           5,
+    "urgency_detected":       15,
+    "gambling_site":          70,
+    "hudson_rock_credentials_stolen":             60,
+    "hudson_rock_high_volume_credentials_stolen": 85,
+    "hudson_rock_employee_credentials_stolen":    100,
 }
 
 
@@ -251,32 +256,32 @@ def calculate_risk(
         score = 0.0
         breakdown: Dict = {}
 
-        # ─── ML Score ────────────────────────────────────────────────────────
+        #  ML Score 
         ml_scaled = math.pow(url_ml_confidence, 1.2)   # Slight superlinear boost
         ml_score  = ml_scaled * 100 * WEIGHTS["url_ml"]
         breakdown["url_ml"] = round(ml_score, 2)
         score += ml_score
 
-        # ─── Content Signals ─────────────────────────────────────────────────
+        # Content Signals 
         image_score = image_risk * 100 * WEIGHTS["image_risk"]
         text_score  = text_risk  * 100 * WEIGHTS["text_risk"]
         breakdown["image_risk"] = round(image_score, 2)
         breakdown["text_risk"]  = round(text_score, 2)
         score += image_score + text_score
 
-        # ─── Domain Age ──────────────────────────────────────────────────────
+        #  Domain Age 
         age_raw       = calculate_domain_age_score(domain_age_days)
         age_component = age_raw * WEIGHTS["domain_age"]
         breakdown["domain_age"] = round(age_component, 2)
         score += age_component
 
-        # ─── HTTPS ───────────────────────────────────────────────────────────
+        # HTTPS
         https_raw       = 0 if is_https else 30   # Larger penalty for no HTTPS
         https_component = https_raw * WEIGHTS["https"]
         breakdown["https"] = round(https_component, 2)
         score += https_component
 
-        # ─── Suspicious Patterns ─────────────────────────────────────────────
+        #  Suspicious Patterns 
         pattern_raw = calculate_pattern_score(suspicious_patterns)
 
         # Scale patterns by ML confidence correlation
@@ -305,6 +310,32 @@ def calculate_risk(
         blacklist_bonus = 25.0 if bl_hit else 0.0
         breakdown["blacklist"] = round(blacklist_bonus, 2)
         score += blacklist_bonus
+
+        # ─── Critical Signal Overrides ───────────────────────────────────────
+        # Ensure that critical findings bypass the low ML confidence suppression
+        critical_bonus = 0.0
+        if bl_hit:
+            # Force score into HIGH/CRITICAL territory, bypassing penalties
+            critical_bonus += 65.0
+        if "brand_impersonation" in suspicious_patterns:
+            critical_bonus += 45.0
+        if "suspicious_password_form" in suspicious_patterns:
+            critical_bonus += 20.0
+        if "http_login_form" in suspicious_patterns:
+            critical_bonus += 20.0
+            
+        if "gambling_site" in suspicious_patterns:
+            critical_bonus += 50.0
+            
+        if "hudson_rock_employee_credentials_stolen" in suspicious_patterns:
+            critical_bonus += 80.0
+        elif "hudson_rock_high_volume_credentials_stolen" in suspicious_patterns:
+            critical_bonus += 60.0
+        elif "hudson_rock_credentials_stolen" in suspicious_patterns:
+            critical_bonus += 40.0
+        
+        breakdown["critical_bonus"] = round(critical_bonus, 2)
+        score += critical_bonus
 
         # ─── Combo Detection ─────────────────────────────────────────────────
         combo_score = 0.0
@@ -343,10 +374,11 @@ def calculate_risk(
         final_score = (score * 0.85) + (ml_score * 0.15)
 
         # Suppress low URL ML confidence from producing very high scores (skip when no URL ML signal)
-        if 0 < url_ml_confidence < 0.15 and final_score < 40 and not bl_hit:
+        has_hard_evidence = bl_hit or (critical_bonus > 0)
+        if 0 < url_ml_confidence < 0.15 and final_score < 40 and not has_hard_evidence:
             final_score = min(final_score, 25.0)
 
-        if final_score > 92 and 0 < url_ml_confidence < 0.4 and not bl_hit:
+        if final_score > 92 and 0 < url_ml_confidence < 0.4 and not has_hard_evidence:
             final_score = 88.0
 
         final_score = max(0.0, min(round(final_score, 2), 100.0))
@@ -371,3 +403,4 @@ def calculate_risk(
     except Exception as e:
         logger.error("risk_engine_failed | %s", str(e))
         return "UNKNOWN", 0.0, {}
+

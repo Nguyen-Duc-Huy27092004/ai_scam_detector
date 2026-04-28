@@ -20,9 +20,11 @@ from fastapi.responses import JSONResponse
 
 from utils.logger import logger
 from utils.validators import is_valid_url
-from utils.url_utils import is_safe_url, normalize_url
+from utils.url_utils import is_safe_url, is_safe_url_detailed, normalize_url
 from utils.content_sanitizer import sanitize_for_llm, wrap_for_llm
 from services.url_pipeline import analyze_url
+from ml.url.db import AnalysisHistory
+import json
 from services.deep_url_analyzer import DeepURLAnalyzer
 from services.llm_fusion import fuse_llm_with_risk
 from schemas.url import URLAnalyzeRequest, URLAnalyzeResponse
@@ -49,7 +51,8 @@ def _build_url_response(url: str, result: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(llm, dict) and llm.get("analysis_summary"):
         risk_summary = llm["analysis_summary"]
     elif risk_factors:
-        risk_summary = f"Phát hiện {len(risk_factors)} tín hiệu rủi ro."
+        from services.llm_fusion import _labels as _signal_labels
+        risk_summary = f"Phát hiện {len(risk_factors)} tín hiệu rủi ro: {_signal_labels(risk_factors, limit=3)}."
     else:
         risk_summary = "Không phát hiện tín hiệu rủi ro đáng kể."
 
@@ -65,6 +68,11 @@ def _build_url_response(url: str, result: Dict[str, Any]) -> Dict[str, Any]:
     brand     = result.get("brand_check") or {}
     network   = result.get("network") or {}
     page_meta = result.get("page_metadata") or {}
+
+    # Suppress screenshot for adult content
+    screenshot_data = None
+    if not (isinstance(llm, dict) and llm.get("is_adult")):
+        screenshot_data = _load_screenshot(result.get("screenshot"))
 
     return {
         "url":               url,
@@ -89,9 +97,10 @@ def _build_url_response(url: str, result: Dict[str, Any]) -> Dict[str, Any]:
         "site_type":         llm.get("site_type", "safe") if isinstance(llm, dict) else "safe",
         "advice":            advice_text,
         "recommendations":   recommendations,
-        "screenshot":        _load_screenshot(result.get("screenshot")),
+        "screenshot":        screenshot_data,
         "record_id":         result.get("record_id"),
         "domain_info":       result.get("domain_info"),
+        "hudson_rock":       result.get("hudson_rock"),   # infostealer credential leak data
     }
 
 
@@ -116,10 +125,22 @@ def _load_screenshot(screenshot_filename) -> Optional[str]:
 
 
 def _normalize_cache_key(url: str) -> str:
+    """
+    Produce a canonical string suitable for use as a cache key.
+    Normalizes: scheme (lowercase), host (lowercase), strips trailing slash on path.
+    Falls back gracefully on any parse error.
+    """
     try:
-        return normalize_url(url)
+        normalized = normalize_url(url)
+        if normalized:
+            return normalized.lower().rstrip("/")
     except Exception:
-        return url.lower().rstrip("/")
+        pass
+    return url.lower().rstrip("/")
+
+
+def _make_cache_key(normalized_url: str) -> str:
+    return f"url_analysis:{normalized_url}"
 
 
 # ==============================
@@ -142,28 +163,66 @@ async def analyze(
             timestamp=datetime.utcnow().isoformat() + "Z"
         )
 
-    if not is_safe_url(url):
-        logger.warning("analyze_ssrf_blocked | url=%s", url[:100])
+    _url_safe, _url_reason = is_safe_url_detailed(url)
+    if not _url_safe:
+        logger.warning("analyze_ssrf_blocked | url=%s | reason=%s", url[:100], _url_reason)
+        _error_msg = {
+            "private_ip":           "URL này trỏ về một địa chỉ IP riêng tư/nội bộ và không thể được phân tích.",
+            "dns_resolution_failed": "Không thể tra cứu DNS cho domain này. Hãy kiểm tra xem URL có hợp lệ không.",
+            "localhost":             "URL trỏ về localhost và không được phép phân tích.",
+            "internal_tld":          "Domain sử dụng TLD nội bộ (.local, .lan, ...) không được hỗ trợ.",
+            "disallowed_scheme":     "Chỉ hỗ trợ http và https.",
+            "metadata_host":         "URL trỏ đến Cloud Metadata Endpoint và bị chặn vì lý do bảo mật.",
+        }.get(_url_reason, "URL không hợp lệ hoặc không thể tiếp cận được.")
         return URLAnalyzeResponse(
             success=False,
-            error="URL resolves to a private or reserved address",
+            error=_error_msg,
             timestamp=datetime.utcnow().isoformat() + "Z"
         )
 
     logger.info("url_analyze_requested | %s", url[:120])
 
-    cache_key = f"url_analysis:{_normalize_cache_key(url)}"
-    cached_result = await cache.get(cache_key)
+    # -------------------------------------------------------
+    # Step 1: Check in-memory / Redis cache (URL gốc)
+    # -------------------------------------------------------
+    norm_original = _normalize_cache_key(url)
+    cache_key_original = _make_cache_key(norm_original)
+
+    cached_result = await cache.get(cache_key_original)
     if cached_result:
-        logger.info("url_analyze_cache_hit | %s", url[:120])
+        logger.info("url_analyze_cache_hit | source=memory_redis | %s", url[:120])
         return URLAnalyzeResponse(
             success=True,
             data=cached_result,
             timestamp=datetime.utcnow().isoformat() + "Z"
         )
 
+    # -------------------------------------------------------
+    # Step 2: Check DB (persistent cache — survives restart)
+    # Lookup dùng normalized URL gốc (nhất quán với gì được lưu)
+    # -------------------------------------------------------
     try:
-        # analyze_url is now async — call directly
+        db_record = await asyncio.to_thread(
+            AnalysisHistory.get_by_input_value, "url", norm_original
+        )
+        if db_record and db_record.get("evidence_json"):
+            db_data = json.loads(db_record["evidence_json"])
+            if isinstance(db_data, dict) and "url" in db_data:
+                logger.info("url_analyze_db_hit | %s", url[:120])
+                # Warm lại in-memory/Redis cache để request tiếp theo không cần vào DB
+                await cache.set(cache_key_original, db_data, expire_seconds=7200)
+                return URLAnalyzeResponse(
+                    success=True,
+                    data=db_data,
+                    timestamp=datetime.utcnow().isoformat() + "Z"
+                )
+    except Exception as e:
+        logger.warning("db_cache_lookup_failed | %s", str(e))
+
+    # -------------------------------------------------------
+    # Step 3: Chạy pipeline phân tích
+    # -------------------------------------------------------
+    try:
         result = await analyze_url(url)
     except Exception as e:
         logger.error("url_analyze_error | %s", str(e))
@@ -180,8 +239,45 @@ async def analyze(
             timestamp=datetime.utcnow().isoformat() + "Z"
         )
 
+    # -------------------------------------------------------
+    # Step 4: Build response
+    # -------------------------------------------------------
     response_data = _build_url_response(url, result)
-    await cache.set(cache_key, response_data, expire_seconds=7200)
+
+    # -------------------------------------------------------
+    # Step 5: Dual-key cache — lưu cả key URL gốc lẫn key final_url
+    # Lý do: user có thể gõ URL trước redirect (http://ex.com) hoặc
+    # sau redirect (https://ex.com) — cả 2 đều phải hit cache
+    # -------------------------------------------------------
+    final_url: str = result.get("url") or url
+    norm_final = _normalize_cache_key(final_url)
+    cache_key_final = _make_cache_key(norm_final)
+
+    await cache.set(cache_key_original, response_data, expire_seconds=7200)
+    if norm_final != norm_original:
+        # Chỉ set key thứ 2 nếu URL thực sự khác (tránh lưu trùng)
+        await cache.set(cache_key_final, response_data, expire_seconds=7200)
+        logger.debug("url_analyze_dual_key_cached | original=%s | final=%s", norm_original[:80], norm_final[:80])
+
+    # -------------------------------------------------------
+    # Step 6: Lưu DB — dùng normalized URL gốc làm input_value
+    # (nhất quán với Step 2 lookup)
+    # -------------------------------------------------------
+    try:
+        await asyncio.to_thread(AnalysisHistory.create, {
+            "input_type": "url",
+            "input_value": norm_original,   # ← normalized để lookup nhất quán
+            "label": "url_scan",
+            "risk_level": response_data.get("risk_level", "unknown"),
+            "confidence": response_data.get("confidence", 0.0),
+            "advice": response_data.get("advice", ""),
+            "screenshot_path": result.get("screenshot"),
+            "ocr_text": "",
+            "evidence_json": json.dumps(response_data),
+            "model_version": "pipeline_v2",
+        })
+    except Exception as e:
+        logger.warning("failed_to_save_url_history | %s", str(e))
 
     return URLAnalyzeResponse(
         success=True,
@@ -214,12 +310,20 @@ async def deep_analyze(
                      "timestamp": datetime.utcnow().isoformat() + "Z"}
         )
 
-    if not is_safe_url(url):
-        logger.warning("deep_analyze_ssrf_blocked | url=%s", url[:100])
+    _url_safe, _url_reason = is_safe_url_detailed(url)
+    if not _url_safe:
+        logger.warning("deep_analyze_ssrf_blocked | url=%s | reason=%s", url[:100], _url_reason)
+        _error_msg = {
+            "private_ip":           "URL này trỏ về một địa chỉ IP riêng tư/nội bộ và không thể được phân tích.",
+            "dns_resolution_failed": "Không thể tra cứu DNS cho domain này. Hãy kiểm tra xem URL có hợp lệ không.",
+            "localhost":             "URL trỏ về localhost và không được phép phân tích.",
+            "internal_tld":          "Domain sử dụng TLD nội bộ (.local, .lan, ...) không được hỗ trợ.",
+            "disallowed_scheme":     "Chỉ hỗ trợ http và https.",
+            "metadata_host":         "URL trỏ đến Cloud Metadata Endpoint và bị chặn vì lý do bảo mật.",
+        }.get(_url_reason, "URL không hợp lệ hoặc không thể tiếp cận được.")
         return JSONResponse(
             status_code=403,
-            content={"success": False,
-                     "error": "URL resolves to a private or reserved address",
+            content={"success": False, "error": _error_msg,
                      "timestamp": datetime.utcnow().isoformat() + "Z"}
         )
 
@@ -233,6 +337,20 @@ async def deep_analyze(
             content={"success": True, "data": cached,
                      "timestamp": datetime.utcnow().isoformat() + "Z"}
         )
+
+    try:
+        db_record = await asyncio.to_thread(AnalysisHistory.get_by_input_value, "deep_url", url)
+        if db_record and db_record.get("evidence_json"):
+            db_data = json.loads(db_record["evidence_json"])
+            if isinstance(db_data, dict) and "url" in db_data:
+                logger.info("url_deep_analyze_db_hit | %s", url[:120])
+                await cache.set(cache_key, db_data, expire_seconds=3600)
+                return JSONResponse(
+                    content={"success": True, "data": db_data,
+                             "timestamp": datetime.utcnow().isoformat() + "Z"}
+                )
+    except Exception as e:
+        logger.warning("db_cache_lookup_failed_deep | %s", str(e))
 
     # -------------------------------------------------------
     # Step 1: Run the AUTHORITATIVE pipeline (risk engine)
@@ -347,9 +465,9 @@ async def deep_analyze(
 
     response_data = {
         "url":                url,
-        "risk_score":         score,
-        "risk_score_percent": round(score, 0),
-        "risk_level":         risk_level.lower(),
+        "risk_score":         fused.get("score", score),
+        "risk_score_percent": round(fused.get("score", score), 0),
+        "risk_level":         str(fused.get("risk_level", risk_level)).lower(),
         "signals":            signals,
         "site_type":          fused["site_type"],
         "llm_explanation":    fused,
@@ -358,6 +476,22 @@ async def deep_analyze(
     }
 
     await cache.set(cache_key, response_data, expire_seconds=3600)
+
+    try:
+        await asyncio.to_thread(AnalysisHistory.create, {
+            "input_type": "deep_url",
+            "input_value": url,
+            "label": "deep_url_scan",
+            "risk_level": risk_level.lower(),
+            "confidence": confidence,
+            "advice": fused.get("recommended_action", ""),
+            "screenshot_path": base_result.get("screenshot"),
+            "ocr_text": "",
+            "evidence_json": json.dumps(response_data),
+            "model_version": "deep_pipeline_v2",
+        })
+    except Exception as e:
+        logger.warning("failed_to_save_deep_url_history | %s", str(e))
 
     return JSONResponse(
         content={

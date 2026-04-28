@@ -21,9 +21,7 @@ class URLFeatureExtractor:
 
         features = {}
 
-        # ==========================
         # Basic structure
-        # ==========================
 
         features["NumDots"] = url.count(".")
         features["SubdomainLevel"] = max(hostname.count(".") - 1, 0)
@@ -46,9 +44,9 @@ class URLFeatureExtractor:
 
         features["NoHttps"] = 1 if parsed.scheme != "https" else 0
 
-        # ==========================
-        # Random string detection (entropy nhẹ)
-        # ==========================
+
+        # Random string detection 
+
 
         def entropy(s):
             import math
